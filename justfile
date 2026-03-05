@@ -50,4 +50,18 @@ install:
 [doc("Run a quick 3s demo")]
 [group("dev")]
 demo:
-    cargo run -- 3 --no-bell
+    cargo run -- 3
+
+[doc("Demo all bar styles")]
+[group("dev")]
+demo-all:
+    @echo "=== dot (default) ===" && cargo run -- 3
+    @echo "=== block ===" && cargo run -- 3 --style block
+    @echo "=== hash ===" && cargo run -- 3 --style hash
+    @echo "=== arrow ===" && cargo run -- 3 --style arrow
+    @echo "=== no-bar ===" && cargo run -- 3 --no-bar
+
+[doc("Remove build artifacts")]
+[group("dev")]
+clean:
+    cargo clean

@@ -224,7 +224,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sleepp"
+name = "sleepx"
 version = "0.1.0"
 dependencies = [
  "clap",

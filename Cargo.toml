@@ -1,12 +1,15 @@
 [package]
-name = "sleepp"
+name = "sleepx"
 version = "0.1.0"
 edition = "2024"
 description = "sleep with a progress bar"
 license = "MIT"
-repository = "https://github.com/m9810223/sleepp"
+repository = "https://github.com/m9810223/sleepx"
+readme = "README.md"
+keywords = ["sleep", "progress-bar", "cli", "countdown", "timer"]
+categories = ["command-line-utilities"]
 
 [dependencies]
-clap = { version = "4.5.60", features = ["derive"] }
+clap = { version = "4.5.60", features = ["derive", "env"] }
 ctrlc = { version = "3.5.2", features = ["termination"] }
 humantime = "2.3.0"
