@@ -273,21 +273,20 @@ fn render_progress(
         1.0
     };
 
-    let remaining = if total > elapsed {
-        total - elapsed
-    } else {
-        Duration::ZERO
-    };
+    // Truncate to whole seconds and derive remaining so the equation always holds
+    let total_secs = total.as_secs();
+    let elapsed_secs = elapsed.as_secs().min(total_secs);
+    let remaining_secs = total_secs - elapsed_secs;
 
-    let elapsed_str = format_duration_fixed(elapsed, total);
     let total_str = format_duration_fixed(total, total);
-    let remaining_str = format_duration_fixed(remaining, total);
+    let elapsed_str = format_duration_fixed(Duration::from_secs(elapsed_secs), total);
+    let remaining_str = format_duration_fixed(Duration::from_secs(remaining_secs), total);
     let pct = progress * 100.0;
     let pct_str = format!("{:5.1}%", pct);
 
     if no_bar {
         return format!(
-            "{} {}{}{} ↓ {}{}{} ↑ {}{}{}",
+            "{} - {}{}{} = {}{}{} {}{}{}",
             total_str,
             theme.remaining, remaining_str, theme.reset,
             theme.elapsed, elapsed_str, theme.reset,
@@ -295,13 +294,13 @@ fn render_progress(
         );
     }
 
-    // Layout: "{total} {remaining} ↓ {elapsed} ↑ {lb}{bar}{rb} {pct}"
+    // Layout: "{total} - {remaining} = {elapsed} {lb}{bar}{rb} {pct}"
     let lb = &chars.bar_left;
     let rb = &chars.bar_right;
     let dur_w = duration_display_width(total);
-    let overhead = dur_w + 1              // total + space
-        + dur_w + 2 + 1                  // remaining + " ↓" + space
-        + dur_w + 2 + 1                  // elapsed + " ↑" + space
+    let overhead = dur_w + 3              // total + " - "
+        + dur_w + 3                      // remaining + " = "
+        + dur_w + 1                      // elapsed + space
         + lb.chars().count() + rb.chars().count()
         + 1 + 6;                         // space + pct
     let bar_width = get_terminal_width()
@@ -347,7 +346,7 @@ fn render_progress(
     };
 
     format!(
-        "{} {}{}{} ↓ {}{}{} ↑ {}{}{}{}{}{}{} {}{}{}",
+        "{} - {}{}{} = {}{}{} {}{}{}{}{}{}{} {}{}{}",
         total_str,
         theme.remaining, remaining_str, theme.reset,
         theme.elapsed, elapsed_str, theme.reset,
@@ -360,24 +359,28 @@ fn render_progress(
 
 fn render_done(total: Duration, chars: &BarChars, no_bar: bool, theme: &Theme) -> String {
     let total_str = format_duration_fixed(total, total);
+    let zero_str = format_duration_fixed(Duration::ZERO, total);
     let dur_w = duration_display_width(total);
-    // "Done!" padded to match "{remaining} ↓ {elapsed} ↑" width = dur_w+2 + 1 + dur_w+2 = 2*dur_w+5
-    let done_padded = format!("{:<width$}", "Done!", width = 2 * dur_w + 5);
+    let done_w = dur_w.max(5);
+    let done_padded = format!("{:<width$}", "Done!", width = done_w);
     let done_label = format!("{}{}{}", theme.done, done_padded, theme.reset);
     let pct_str = "100.0%";
 
     if no_bar {
         return format!(
-            "{} {} {}{}{}",
-            total_str, done_label,
+            "{} - {}{}{} = {} {}{}{}",
+            total_str,
+            theme.remaining, zero_str, theme.reset,
+            done_label,
             theme.pct, pct_str, theme.reset,
         );
     }
 
     let lb = &chars.bar_left;
     let rb = &chars.bar_right;
-    let overhead = dur_w + 1              // total + space
-        + 2 * dur_w + 5 + 1              // done_label + space
+    let overhead = dur_w + 3              // total + " - "
+        + dur_w + 3                      // remaining + " = "
+        + done_w + 1                     // done_label + space
         + lb.chars().count() + rb.chars().count()
         + 1 + 6;                         // space + pct
     let bar_width = get_terminal_width()
@@ -385,8 +388,10 @@ fn render_done(total: Duration, chars: &BarChars, no_bar: bool, theme: &Theme) -
         .max(10);
 
     format!(
-        "{} {} {}{}{}{}{}{}{}{}{} {}{}{}",
-        total_str, done_label,
+        "{} - {}{}{} = {} {}{}{}{}{}{}{}{}{} {}{}{}",
+        total_str,
+        theme.remaining, zero_str, theme.reset,
+        done_label,
         theme.bracket, lb, theme.reset,
         theme.bar_fill, chars.fill.repeat(bar_width), theme.reset,
         theme.bracket, rb, theme.reset,
@@ -496,10 +501,15 @@ fn main() {
 
     loop {
         if interrupted.load(Ordering::SeqCst) {
+            let elapsed = start.elapsed().min(total);
+            let output = render_progress(elapsed, total, &chars, no_bar, theme);
             if is_tty {
                 clear_wrapped_lines(prev_display_width);
+                print!("{}\x1b[K\n", output);
+            } else {
+                println!("{}", output);
             }
-            println!("Interrupted.");
+            io::stdout().flush().ok();
             std::process::exit(130);
         }
 
