@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use terminal_size::{Width, terminal_size};
 
 /// A sleep command with an inline progress bar and countdown display.
 ///
@@ -18,25 +19,37 @@ struct Cli {
     /// Duration to sleep. Examples: 30, 1m30s, 2h5m
     duration: String,
 
-    /// Progress bar style: dot, block, hash, arrow
-    #[arg(short = 'S', long, default_value = "dot", env = "SLEEPX_STYLE")]
+    /// Progress bar style: arrow, dot, block, hash
+    #[arg(short = 'S', long, default_value = "arrow", env = "SLEEPX_STYLE")]
     style: BarStyle,
 
-    /// Custom fill character (overrides --style)
-    #[arg(long, env = "SLEEPX_FILL")]
-    fill: Option<String>,
+    /// Custom left bracket character (default: [)
+    #[arg(long, default_value = "[", env = "SLEEPX_BAR_LEFT")]
+    bar_left: String,
+
+    /// Custom right bracket character (default: ])
+    #[arg(long, default_value = "]", env = "SLEEPX_BAR_RIGHT")]
+    bar_right: String,
 
     /// Custom empty character (overrides --style)
-    #[arg(long, env = "SLEEPX_EMPTY")]
-    empty: Option<String>,
+    #[arg(long, env = "SLEEPX_BAR_EMPTY")]
+    bar_empty: Option<String>,
 
-    /// Force show progress bar (even in non-TTY)
-    #[arg(short = 'b', long, conflicts_with = "no_bar", env = "SLEEPX_BAR")]
-    bar: bool,
+    /// Custom fill character (overrides --style)
+    #[arg(long, env = "SLEEPX_BAR_FILL")]
+    bar_fill: Option<String>,
 
-    /// Don't show progress bar, only text (auto-enabled in non-TTY)
-    #[arg(long, env = "SLEEPX_NO_BAR")]
-    no_bar: bool,
+    /// Custom tip character for progress indicator (e.g., >)
+    #[arg(long, env = "SLEEPX_BAR_TIP")]
+    bar_tip: Option<String>,
+
+    /// Progress bar visibility: auto (default), on, off
+    #[arg(short = 'b', long, default_value = "auto", env = "SLEEPX_BAR")]
+    bar: BarVisibility,
+
+    /// Color output: auto (default, TTY only), on, off
+    #[arg(short = 'c', long, default_value = "auto", env = "SLEEPX_COLOR")]
+    color: ColorMode,
 
     /// Use macOS `say` to announce when done
     #[arg(short = 's', long, env = "SLEEPX_SAY")]
@@ -52,41 +65,93 @@ struct Cli {
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
+enum BarVisibility {
+    Auto,
+    On,
+    Off,
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum ColorMode {
+    Auto,
+    On,
+    Off,
+}
+
+struct Theme {
+    bar_fill: &'static str,
+    bar_empty: &'static str,
+    bracket: &'static str,
+    remaining: &'static str,
+    elapsed: &'static str,
+    pct: &'static str,
+    done: &'static str,
+    reset: &'static str,
+}
+
+const COLOR_THEME: Theme = Theme {
+    bar_fill: "\x1b[32m",       // green
+    bar_empty: "\x1b[2m",       // dim
+    bracket: "\x1b[2m",         // dim
+    remaining: "\x1b[33m",      // yellow (countdown)
+    elapsed: "\x1b[36m",        // cyan
+    pct: "\x1b[1m",             // bold
+    done: "\x1b[1;32m",         // bold green
+    reset: "\x1b[0m",
+};
+
+const NO_COLOR: Theme = Theme {
+    bar_fill: "",
+    bar_empty: "",
+    bracket: "",
+    remaining: "",
+    elapsed: "",
+    pct: "",
+    done: "",
+    reset: "",
+};
+
+#[derive(Clone, Debug, clap::ValueEnum)]
 enum BarStyle {
+    Arrow,
     Dot,
     Block,
     Hash,
-    Arrow,
 }
 
 impl BarStyle {
     fn fill_char(&self) -> &str {
         match self {
+            BarStyle::Arrow => "=",
             BarStyle::Dot => "●",
             BarStyle::Block => "█",
             BarStyle::Hash => "#",
-            BarStyle::Arrow => "=",
         }
     }
 
     fn empty_char(&self) -> &str {
         match self {
+            BarStyle::Arrow => " ",
             BarStyle::Dot => "○",
             BarStyle::Block => "░",
             BarStyle::Hash => "-",
-            BarStyle::Arrow => "-",
         }
     }
 
-    fn is_arrow(&self) -> bool {
-        matches!(self, BarStyle::Arrow)
+    fn tip_char(&self) -> Option<&str> {
+        match self {
+            BarStyle::Arrow => Some(">"),
+            _ => None,
+        }
     }
 }
 
 struct BarChars {
     fill: String,
     empty: String,
-    is_arrow: bool,
+    tip: Option<String>,
+    bar_left: String,
+    bar_right: String,
 }
 
 fn parse_duration(input: &str) -> Result<Duration, String> {
@@ -102,19 +167,61 @@ fn parse_duration(input: &str) -> Result<Duration, String> {
     humantime::parse_duration(input).map_err(|e| format!("Invalid duration '{}': {}", input, e))
 }
 
-fn format_duration(d: Duration) -> String {
-    let total_secs = d.as_secs();
-    let hours = total_secs / 3600;
-    let mins = (total_secs % 3600) / 60;
-    let secs = total_secs % 60;
+fn hour_digits(total: Duration) -> usize {
+    let h = total.as_secs() / 3600;
+    if h == 0 { 2 } else { (h.ilog10() as usize + 1).max(2) }
+}
 
-    if hours > 0 {
-        format!("{:02}:{:02}:{:02}", hours, mins, secs)
-    } else if mins > 0 {
-        format!("{:02}:{:02}", mins, secs)
+fn format_duration_fixed(d: Duration, total: Duration) -> String {
+    let total_secs = total.as_secs();
+    let secs = d.as_secs();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+
+    if total_secs >= 3600 {
+        let w = hour_digits(total);
+        let raw = format!("{:0>w$}:{:02}:{:02}", h, m, s);
+        prettify_duration(&raw)
+    } else if total_secs >= 60 {
+        let raw = format!("{:02}:{:02}", m, s);
+        prettify_duration(&raw)
+    } else if total_secs >= 10 {
+        format!("{:2}s", s)
     } else {
-        format!("{}s", secs)
+        format!("{}s", s)
     }
+}
+
+/// Suppress leading "00:" groups, then replace single leading zero with space.
+fn prettify_duration(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut result = String::with_capacity(s.len());
+    let mut i = 0;
+    while i + 2 < bytes.len()
+        && bytes[i] == b'0'
+        && bytes[i + 1] == b'0'
+        && bytes[i + 2] == b':'
+    {
+        result.push_str("   ");
+        i += 3;
+    }
+    if i < bytes.len() && bytes[i] == b'0' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit()
+    {
+        result.push(' ');
+        i += 1;
+    }
+    result.push_str(&s[i..]);
+    result
+}
+
+fn duration_display_width(total: Duration) -> usize {
+    let secs = total.as_secs();
+    if secs >= 3600 {
+        hour_digits(total) + 6 // H..H:MM:SS
+    } else if secs >= 60 { 5 } // MM:SS
+    else if secs >= 10 { 3 }   // NNs
+    else { 2 }                  // Ns
 }
 
 fn non_tty_interval(remaining: Duration, min: Duration, max: Duration) -> Duration {
@@ -133,12 +240,32 @@ fn non_tty_interval(remaining: Duration, min: Duration, max: Duration) -> Durati
     base.clamp(min, max)
 }
 
+fn get_terminal_width() -> usize {
+    terminal_size()
+        .map(|(Width(w), _)| (w as usize).saturating_sub(1))
+        .unwrap_or(79)
+}
+
+/// Clear previously rendered output that may have wrapped across multiple lines.
+fn clear_wrapped_lines(prev_output_len: usize) {
+    let term_width = get_terminal_width();
+    if prev_output_len > 0 && term_width > 0 {
+        let lines = (prev_output_len + term_width - 1) / term_width;
+        if lines > 1 {
+            // Move cursor up to the first wrapped line
+            print!("\x1b[{}A", lines - 1);
+        }
+    }
+    // Return to column 1 and clear from cursor to end of display
+    print!("\r\x1b[J");
+}
+
 fn render_progress(
     elapsed: Duration,
     total: Duration,
-    bar_width: usize,
     chars: &BarChars,
     no_bar: bool,
+    theme: &Theme,
 ) -> String {
     let progress = if total.as_secs_f64() > 0.0 {
         (elapsed.as_secs_f64() / total.as_secs_f64()).min(1.0)
@@ -152,43 +279,119 @@ fn render_progress(
         Duration::ZERO
     };
 
-    let elapsed_str = format_duration(elapsed);
-    let remaining_str = format_duration(remaining);
-    let pct = (progress * 100.0) as u32;
-    let time_info = format!(
-        "{} elapsed, {} remaining ({:3}%)",
-        elapsed_str, remaining_str, pct
-    );
+    let elapsed_str = format_duration_fixed(elapsed, total);
+    let total_str = format_duration_fixed(total, total);
+    let remaining_str = format_duration_fixed(remaining, total);
+    let pct = progress * 100.0;
+    let pct_str = format!("{:5.1}%", pct);
 
     if no_bar {
-        return time_info;
+        return format!(
+            "{} {}{}{} ↓ {}{}{} ↑ {}{}{}",
+            total_str,
+            theme.remaining, remaining_str, theme.reset,
+            theme.elapsed, elapsed_str, theme.reset,
+            theme.pct, pct_str, theme.reset,
+        );
     }
+
+    // Layout: "{total} {remaining} ↓ {elapsed} ↑ {lb}{bar}{rb} {pct}"
+    let lb = &chars.bar_left;
+    let rb = &chars.bar_right;
+    let dur_w = duration_display_width(total);
+    let overhead = dur_w + 1              // total + space
+        + dur_w + 2 + 1                  // remaining + " ↓" + space
+        + dur_w + 2 + 1                  // elapsed + " ↑" + space
+        + lb.chars().count() + rb.chars().count()
+        + 1 + 6;                         // space + pct
+    let bar_width = get_terminal_width()
+        .saturating_sub(overhead)
+        .max(10);
 
     let filled = (progress * bar_width as f64) as usize;
     let empty = bar_width.saturating_sub(filled);
 
-    let bar_content = if chars.is_arrow && filled > 0 && empty > 0 {
-        format!(
-            "{}>{}",
-            chars.fill.repeat(filled - 1),
-            chars.empty.repeat(empty),
-        )
+    let bar_content = if let Some(ref tip) = chars.tip {
+        if filled > 0 && empty > 0 {
+            format!(
+                "{}{}{}{}{}{}{}",
+                theme.bar_fill,
+                chars.fill.repeat(filled - 1),
+                tip,
+                theme.reset,
+                theme.bar_empty,
+                chars.empty.repeat(empty),
+                theme.reset,
+            )
+        } else {
+            format!(
+                "{}{}{}{}{}{}",
+                theme.bar_fill,
+                chars.fill.repeat(filled),
+                theme.reset,
+                theme.bar_empty,
+                chars.empty.repeat(empty),
+                theme.reset,
+            )
+        }
     } else {
-        format!("{}{}", chars.fill.repeat(filled), chars.empty.repeat(empty))
+        format!(
+            "{}{}{}{}{}{}",
+            theme.bar_fill,
+            chars.fill.repeat(filled),
+            theme.reset,
+            theme.bar_empty,
+            chars.empty.repeat(empty),
+            theme.reset,
+        )
     };
 
-    format!("[{}] {}", bar_content, time_info)
+    format!(
+        "{} {}{}{} ↓ {}{}{} ↑ {}{}{}{}{}{}{} {}{}{}",
+        total_str,
+        theme.remaining, remaining_str, theme.reset,
+        theme.elapsed, elapsed_str, theme.reset,
+        theme.bracket, lb, theme.reset,
+        bar_content,
+        theme.bracket, rb, theme.reset,
+        theme.pct, pct_str, theme.reset,
+    )
 }
 
-fn render_done(total: Duration, bar_width: usize, chars: &BarChars, no_bar: bool) -> String {
-    let elapsed_str = format_duration(total);
-    let done_text = format!("{} elapsed, Done!", elapsed_str);
+fn render_done(total: Duration, chars: &BarChars, no_bar: bool, theme: &Theme) -> String {
+    let total_str = format_duration_fixed(total, total);
+    let dur_w = duration_display_width(total);
+    // "Done!" padded to match "{remaining} ↓ {elapsed} ↑" width = dur_w+2 + 1 + dur_w+2 = 2*dur_w+5
+    let done_padded = format!("{:<width$}", "Done!", width = 2 * dur_w + 5);
+    let done_label = format!("{}{}{}", theme.done, done_padded, theme.reset);
+    let pct_str = "100.0%";
 
     if no_bar {
-        return done_text;
+        return format!(
+            "{} {} {}{}{}",
+            total_str, done_label,
+            theme.pct, pct_str, theme.reset,
+        );
     }
 
-    format!("[{}] {}", chars.fill.repeat(bar_width), done_text,)
+    let lb = &chars.bar_left;
+    let rb = &chars.bar_right;
+    let overhead = dur_w + 1              // total + space
+        + 2 * dur_w + 5 + 1              // done_label + space
+        + lb.chars().count() + rb.chars().count()
+        + 1 + 6;                         // space + pct
+    let bar_width = get_terminal_width()
+        .saturating_sub(overhead)
+        .max(10);
+
+    format!(
+        "{} {} {}{}{}{}{}{}{}{}{} {}{}{}",
+        total_str, done_label,
+        theme.bracket, lb, theme.reset,
+        theme.bar_fill, chars.fill.repeat(bar_width), theme.reset,
+        theme.bracket, rb, theme.reset,
+        theme.pct, pct_str, theme.reset,
+    )
 }
 
 fn main() {
@@ -221,28 +424,45 @@ fn main() {
     let min_interval = Duration::from_secs_f64(cli.min_interval);
     let max_interval = Duration::from_secs_f64(cli.max_interval);
 
-    if let Some(ref f) = cli.fill
+    if let Some(ref f) = cli.bar_fill
         && f.chars().count() != 1
     {
-        eprintln!("Error: --fill must be a single character");
+        eprintln!("Error: --bar-fill must be a single character");
         std::process::exit(1);
     }
-    if let Some(ref e) = cli.empty
+    if let Some(ref e) = cli.bar_empty
         && e.chars().count() != 1
     {
-        eprintln!("Error: --empty must be a single character");
+        eprintln!("Error: --bar-empty must be a single character");
+        std::process::exit(1);
+    }
+    if cli.bar_left.chars().count() != 1 {
+        eprintln!("Error: --bar-left must be a single character");
+        std::process::exit(1);
+    }
+    if cli.bar_right.chars().count() != 1 {
+        eprintln!("Error: --bar-right must be a single character");
+        std::process::exit(1);
+    }
+    if let Some(ref t) = cli.bar_tip
+        && t.chars().count() != 1
+    {
+        eprintln!("Error: --bar-tip must be a single character");
         std::process::exit(1);
     }
 
-    let has_custom_fill = cli.fill.is_some();
     let chars = BarChars {
         fill: cli
-            .fill
+            .bar_fill
             .unwrap_or_else(|| cli.style.fill_char().to_string()),
         empty: cli
-            .empty
+            .bar_empty
             .unwrap_or_else(|| cli.style.empty_char().to_string()),
-        is_arrow: !has_custom_fill && cli.style.is_arrow(),
+        tip: cli
+            .bar_tip
+            .or_else(|| cli.style.tip_char().map(|s| s.to_string())),
+        bar_left: cli.bar_left,
+        bar_right: cli.bar_right,
     };
 
     // Handle Ctrl+C gracefully
@@ -253,23 +473,31 @@ fn main() {
     })
     .expect("Failed to set Ctrl+C handler");
 
-    let bar_width = 30;
     let start = Instant::now();
     let is_tty = io::stdout().is_terminal();
-    let no_bar = if cli.bar {
-        false // --bar: force show
-    } else if cli.no_bar {
-        true // --no-bar: force hide
-    } else {
-        !is_tty // default: TTY shows bar, non-TTY hides bar
+    let no_bar = match cli.bar {
+        BarVisibility::On => false,
+        BarVisibility::Off => true,
+        BarVisibility::Auto => !is_tty,
+    };
+    let theme = match cli.color {
+        ColorMode::On => &COLOR_THEME,
+        ColorMode::Off => &NO_COLOR,
+        ColorMode::Auto => {
+            if is_tty {
+                &COLOR_THEME
+            } else {
+                &NO_COLOR
+            }
+        }
     };
     let mut last_print = Instant::now() - Duration::from_secs(9999); // force first print
+    let mut prev_display_width: usize = 0;
 
     loop {
         if interrupted.load(Ordering::SeqCst) {
             if is_tty {
-                print!("\r\x1b[K");
-                io::stdout().flush().ok();
+                clear_wrapped_lines(prev_display_width);
             }
             println!("Interrupted.");
             std::process::exit(130);
@@ -282,16 +510,22 @@ fn main() {
         }
 
         if is_tty {
-            let output = render_progress(elapsed, total, bar_width, &chars, no_bar);
-            print!("\r{}\x1b[K", output);
+            let output = render_progress(elapsed, total, &chars, no_bar, theme);
+            clear_wrapped_lines(prev_display_width);
+            print!("{}\x1b[K", output);
             io::stdout().flush().ok();
+            prev_display_width = if no_bar {
+                output.len()
+            } else {
+                get_terminal_width()
+            };
             thread::sleep(Duration::from_millis(100));
         } else {
             let remaining = total.saturating_sub(elapsed);
             let interval = non_tty_interval(remaining, min_interval, max_interval);
 
             if last_print.elapsed() >= interval {
-                let output = render_progress(elapsed, total, bar_width, &chars, no_bar);
+                let output = render_progress(elapsed, total, &chars, no_bar, theme);
                 println!("{}", output);
                 last_print = Instant::now();
             }
@@ -300,10 +534,11 @@ fn main() {
     }
 
     // Final state: 100%
-    let done_msg = render_done(total, bar_width, &chars, no_bar);
+    let done_msg = render_done(total, &chars, no_bar, theme);
 
     if is_tty {
-        print!("\r{}\x1b[K\n", done_msg);
+        clear_wrapped_lines(prev_display_width);
+        print!("{}\x1b[K\n", done_msg);
     } else {
         println!("{}", done_msg);
     }

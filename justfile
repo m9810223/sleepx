@@ -61,6 +61,23 @@ demo-all:
     @echo "=== arrow ===" && cargo run -- 3 --style arrow
     @echo "=== no-bar ===" && cargo run -- 3 --no-bar
 
+[doc("Test TTY mode (interactive, with progress bar and milliseconds)")]
+[group("test")]
+test-tty *ARGS:
+    cargo run -- {{ ARGS }}
+
+[doc("Test non-TTY mode (piped, no bar, no milliseconds)")]
+[group("test")]
+test-no-tty *ARGS:
+    cargo run -- {{ ARGS }} | cat
+
+[doc("Test both TTY and non-TTY modes")]
+[group("test")]
+test-modes:
+    @echo "=== TTY mode (interactive) ===" && cargo run -- 3
+    @echo ""
+    @echo "=== non-TTY mode (piped) ===" && cargo run -- 3 | cat
+
 [doc("Remove build artifacts")]
 [group("dev")]
 clean:
