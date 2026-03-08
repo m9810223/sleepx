@@ -27,14 +27,6 @@ struct Cli {
     #[arg(long, default_value = "[", env = "SLEEPX_BAR_LEFT")]
     bar_left: String,
 
-    /// Custom right bracket character (default: ])
-    #[arg(long, default_value = "]", env = "SLEEPX_BAR_RIGHT")]
-    bar_right: String,
-
-    /// Custom empty character (overrides --style)
-    #[arg(long, env = "SLEEPX_BAR_EMPTY")]
-    bar_empty: Option<String>,
-
     /// Custom fill character (overrides --style)
     #[arg(long, env = "SLEEPX_BAR_FILL")]
     bar_fill: Option<String>,
@@ -42,6 +34,14 @@ struct Cli {
     /// Custom tip character for progress indicator (e.g., >)
     #[arg(long, env = "SLEEPX_BAR_TIP")]
     bar_tip: Option<String>,
+
+    /// Custom empty character (overrides --style)
+    #[arg(long, env = "SLEEPX_BAR_EMPTY")]
+    bar_empty: Option<String>,
+
+    /// Custom right bracket character (default: ])
+    #[arg(long, default_value = "]", env = "SLEEPX_BAR_RIGHT")]
+    bar_right: String,
 
     /// Progress bar visibility: auto (default), on, off
     #[arg(short = 'b', long, default_value = "auto", env = "SLEEPX_BAR")]
