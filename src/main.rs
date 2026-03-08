@@ -510,7 +510,12 @@ fn main() {
                 println!("{}", output);
             }
             io::stdout().flush().ok();
-            std::process::exit(130);
+            // Re-raise SIGINT so the parent shell sees a signal death,
+            // not just a non-zero exit (avoids double Ctrl+C in wrappers).
+            unsafe {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::raise(libc::SIGINT);
+            }
         }
 
         let elapsed = start.elapsed();
