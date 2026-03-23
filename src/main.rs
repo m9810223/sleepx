@@ -399,6 +399,29 @@ fn render_done(total: Duration, chars: &BarChars, no_bar: bool, theme: &Theme) -
     )
 }
 
+/// Disable `ECHOCTL` so the terminal does not echo `^C` on Ctrl+C.
+/// Returns the original termios settings for later restoration.
+fn disable_echoctl() -> Option<libc::termios> {
+    unsafe {
+        let mut orig: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut orig) != 0 {
+            return None;
+        }
+        let mut modified = orig;
+        modified.c_lflag &= !libc::ECHOCTL;
+        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &modified) != 0 {
+            return None;
+        }
+        Some(orig)
+    }
+}
+
+fn restore_termios(original: &libc::termios) {
+    unsafe {
+        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, original);
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -480,6 +503,7 @@ fn main() {
 
     let start = Instant::now();
     let is_tty = io::stdout().is_terminal();
+    let orig_termios = if is_tty { disable_echoctl() } else { None };
     let no_bar = match cli.bar {
         BarVisibility::On => false,
         BarVisibility::Off => true,
@@ -510,6 +534,9 @@ fn main() {
                 println!("{}", output);
             }
             io::stdout().flush().ok();
+            if let Some(ref orig) = orig_termios {
+                restore_termios(orig);
+            }
             // Re-raise SIGINT so the parent shell sees a signal death,
             // not just a non-zero exit (avoids double Ctrl+C in wrappers).
             unsafe {
@@ -548,6 +575,10 @@ fn main() {
         }
     }
 
+    if let Some(ref orig) = orig_termios {
+        restore_termios(orig);
+    }
+
     // Final state: 100%
     let done_msg = render_done(total, &chars, no_bar, theme);
 
@@ -564,5 +595,368 @@ fn main() {
         && let Err(e) = Command::new("say").arg("Timer complete").spawn()
     {
         eprintln!("Warning: failed to run `say`: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    // === parse_duration ===
+
+    #[test]
+    fn parse_duration_plain_seconds() {
+        assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn parse_duration_fractional_seconds() {
+        assert_eq!(parse_duration("1.5").unwrap(), Duration::from_secs_f64(1.5));
+    }
+
+    #[test]
+    fn parse_duration_zero() {
+        assert_eq!(parse_duration("0").unwrap(), Duration::from_secs(0));
+    }
+
+    #[test]
+    fn parse_duration_minutes_and_seconds() {
+        assert_eq!(parse_duration("1m30s").unwrap(), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn parse_duration_hours_and_minutes() {
+        assert_eq!(parse_duration("2h5m").unwrap(), Duration::from_secs(7500));
+    }
+
+    #[test]
+    fn parse_duration_hours_minutes_seconds() {
+        assert_eq!(parse_duration("1h2m3s").unwrap(), Duration::from_secs(3723));
+    }
+
+    #[test]
+    fn parse_duration_negative() {
+        let err = parse_duration("-5").unwrap_err();
+        assert!(err.contains("negative"), "expected 'negative' in: {err}");
+    }
+
+    #[test]
+    fn parse_duration_invalid() {
+        let err = parse_duration("abc").unwrap_err();
+        assert!(
+            err.contains("Invalid duration"),
+            "expected 'Invalid duration' in: {err}"
+        );
+    }
+
+    // === hour_digits ===
+
+    #[test]
+    fn hour_digits_zero() {
+        assert_eq!(hour_digits(Duration::from_secs(0)), 2);
+    }
+
+    #[test]
+    fn hour_digits_under_one_hour() {
+        assert_eq!(hour_digits(Duration::from_secs(3599)), 2);
+    }
+
+    #[test]
+    fn hour_digits_exactly_one_hour() {
+        assert_eq!(hour_digits(Duration::from_secs(3600)), 2);
+    }
+
+    #[test]
+    fn hour_digits_ten_hours() {
+        assert_eq!(hour_digits(Duration::from_secs(36000)), 2);
+    }
+
+    #[test]
+    fn hour_digits_hundred_hours() {
+        assert_eq!(hour_digits(Duration::from_secs(360000)), 3);
+    }
+
+    #[test]
+    fn hour_digits_thousand_hours() {
+        assert_eq!(hour_digits(Duration::from_secs(3600000)), 4);
+    }
+
+    // === format_duration_fixed ===
+
+    #[test]
+    fn format_duration_fixed_short_total_single_digit() {
+        assert_eq!(
+            format_duration_fixed(Duration::from_secs(5), Duration::from_secs(9)),
+            "5s"
+        );
+    }
+
+    #[test]
+    fn format_duration_fixed_short_total_zero() {
+        assert_eq!(
+            format_duration_fixed(Duration::from_secs(0), Duration::from_secs(9)),
+            "0s"
+        );
+    }
+
+    #[test]
+    fn format_duration_fixed_two_digit_seconds() {
+        assert_eq!(
+            format_duration_fixed(Duration::from_secs(5), Duration::from_secs(30)),
+            " 5s"
+        );
+    }
+
+    #[test]
+    fn format_duration_fixed_two_digit_full() {
+        assert_eq!(
+            format_duration_fixed(Duration::from_secs(12), Duration::from_secs(30)),
+            "12s"
+        );
+    }
+
+    #[test]
+    fn format_duration_fixed_minutes_range() {
+        assert_eq!(
+            format_duration_fixed(Duration::from_secs(65), Duration::from_secs(120)),
+            " 1:05"
+        );
+    }
+
+    #[test]
+    fn format_duration_fixed_minutes_zero() {
+        assert_eq!(
+            format_duration_fixed(Duration::from_secs(0), Duration::from_secs(120)),
+            "    0"
+        );
+    }
+
+    #[test]
+    fn format_duration_fixed_minutes_exact() {
+        assert_eq!(
+            format_duration_fixed(Duration::from_secs(120), Duration::from_secs(120)),
+            " 2:00"
+        );
+    }
+
+    #[test]
+    fn format_duration_fixed_hours_range() {
+        assert_eq!(
+            format_duration_fixed(Duration::from_secs(3661), Duration::from_secs(7200)),
+            " 1:01:01"
+        );
+    }
+
+    #[test]
+    fn format_duration_fixed_hours_zero() {
+        assert_eq!(
+            format_duration_fixed(Duration::from_secs(0), Duration::from_secs(7200)),
+            "       0"
+        );
+    }
+
+    #[test]
+    fn format_duration_fixed_hundred_hours() {
+        assert_eq!(
+            format_duration_fixed(Duration::from_secs(360000), Duration::from_secs(360000)),
+            "100:00:00"
+        );
+    }
+
+    // === prettify_duration ===
+
+    #[test]
+    fn prettify_duration_no_leading_zeros() {
+        assert_eq!(prettify_duration("12:34"), "12:34");
+    }
+
+    #[test]
+    fn prettify_duration_single_leading_zero() {
+        assert_eq!(prettify_duration("01:05"), " 1:05");
+    }
+
+    #[test]
+    fn prettify_duration_double_zero_minutes() {
+        assert_eq!(prettify_duration("00:05"), "    5");
+    }
+
+    #[test]
+    fn prettify_duration_triple_zero_groups() {
+        assert_eq!(prettify_duration("00:00:05"), "       5");
+    }
+
+    #[test]
+    fn prettify_duration_all_zeros() {
+        assert_eq!(prettify_duration("00:00:00"), "       0");
+    }
+
+    #[test]
+    fn prettify_duration_hours_with_leading_zero() {
+        assert_eq!(prettify_duration("01:02:03"), " 1:02:03");
+    }
+
+    #[test]
+    fn prettify_duration_large_hours() {
+        assert_eq!(prettify_duration("99:59:59"), "99:59:59");
+    }
+
+    // === duration_display_width ===
+
+    #[test]
+    fn duration_display_width_single_digit_seconds() {
+        assert_eq!(duration_display_width(Duration::from_secs(5)), 2);
+    }
+
+    #[test]
+    fn duration_display_width_two_digit_seconds() {
+        assert_eq!(duration_display_width(Duration::from_secs(10)), 3);
+    }
+
+    #[test]
+    fn duration_display_width_thirty_seconds() {
+        assert_eq!(duration_display_width(Duration::from_secs(30)), 3);
+    }
+
+    #[test]
+    fn duration_display_width_one_minute() {
+        assert_eq!(duration_display_width(Duration::from_secs(60)), 5);
+    }
+
+    #[test]
+    fn duration_display_width_under_one_hour() {
+        assert_eq!(duration_display_width(Duration::from_secs(3599)), 5);
+    }
+
+    #[test]
+    fn duration_display_width_one_hour() {
+        assert_eq!(duration_display_width(Duration::from_secs(3600)), 8);
+    }
+
+    #[test]
+    fn duration_display_width_hundred_hours() {
+        assert_eq!(duration_display_width(Duration::from_secs(360000)), 9);
+    }
+
+    // === non_tty_interval ===
+
+    #[test]
+    fn non_tty_interval_large_remaining() {
+        assert_eq!(
+            non_tty_interval(
+                Duration::from_secs(7200),
+                Duration::from_secs(1),
+                Duration::from_secs(60)
+            ),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn non_tty_interval_fifteen_minutes() {
+        assert_eq!(
+            non_tty_interval(
+                Duration::from_secs(900),
+                Duration::from_secs(1),
+                Duration::from_secs(60)
+            ),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn non_tty_interval_two_minutes() {
+        assert_eq!(
+            non_tty_interval(
+                Duration::from_secs(120),
+                Duration::from_secs(1),
+                Duration::from_secs(60)
+            ),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn non_tty_interval_thirty_seconds() {
+        assert_eq!(
+            non_tty_interval(
+                Duration::from_secs(30),
+                Duration::from_secs(1),
+                Duration::from_secs(60)
+            ),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn non_tty_interval_five_seconds() {
+        assert_eq!(
+            non_tty_interval(
+                Duration::from_secs(5),
+                Duration::from_secs(1),
+                Duration::from_secs(60)
+            ),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn non_tty_interval_min_clamp() {
+        assert_eq!(
+            non_tty_interval(
+                Duration::from_secs(5),
+                Duration::from_secs(3),
+                Duration::from_secs(60)
+            ),
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn non_tty_interval_max_clamp() {
+        assert_eq!(
+            non_tty_interval(
+                Duration::from_secs(7200),
+                Duration::from_secs(1),
+                Duration::from_secs(10)
+            ),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn non_tty_interval_boundary_3600() {
+        assert_eq!(
+            non_tty_interval(
+                Duration::from_secs(3600),
+                Duration::from_secs(1),
+                Duration::from_secs(60)
+            ),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn non_tty_interval_boundary_60() {
+        assert_eq!(
+            non_tty_interval(
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                Duration::from_secs(60)
+            ),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn non_tty_interval_boundary_10() {
+        assert_eq!(
+            non_tty_interval(
+                Duration::from_secs(10),
+                Duration::from_secs(1),
+                Duration::from_secs(60)
+            ),
+            Duration::from_secs(1)
+        );
     }
 }

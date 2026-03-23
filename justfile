@@ -61,6 +61,11 @@ demo-all:
     @echo "=== arrow ===" && cargo run -- 3 --style arrow
     @echo "=== no-bar ===" && cargo run -- 3 --no-bar
 
+[doc("Run unit tests")]
+[group("test")]
+test *ARGS:
+    cargo test {{ ARGS }}
+
 [doc("Test TTY mode (interactive, with progress bar and milliseconds)")]
 [group("test")]
 test-tty *ARGS:
