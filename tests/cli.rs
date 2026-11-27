@@ -306,3 +306,65 @@ fn prints_final_progress_line_before_dying() {
         "stderr: {stderr}"
     );
 }
+
+// ---- environment variables ----
+
+/// Runs a short sleep with `SLEEPX_SAY` set and no `say` on PATH, so a true
+/// value shows up as a warning instead of speech. Returns code and stderr.
+fn run_with_say_env(value: &str) -> (Option<i32>, String) {
+    let mut cmd = sleepx();
+    cmd.arg("0.1")
+        .env("SLEEPX_SAY", value)
+        .env("PATH", "/nonexistent");
+    let out = output_with_timeout(cmd);
+    (out.status.code(), stderr_of(&out))
+}
+
+/// Happy: `SLEEPX_SAY` accepts common spellings of "on".
+///
+/// Scenario: `export SLEEPX_SAY=1` in a shell profile.
+/// Purpose: only `true`/`false` used to parse; `1` or `yes` failed with exit 2.
+/// Means: set `1`, `yes`, `on` and `TRUE`, with `say` missing from PATH.
+/// Checks: exit 0, and the missing-`say` warning proves the flag is on.
+#[test]
+fn say_env_accepts_boolish_true_values() {
+    for value in ["1", "yes", "on", "TRUE"] {
+        let (code, stderr) = run_with_say_env(value);
+        assert_eq!(code, Some(0), "SLEEPX_SAY={value}, stderr: {stderr}");
+        assert!(
+            stderr.contains("`say`"),
+            "SLEEPX_SAY={value}, stderr: {stderr}"
+        );
+    }
+}
+
+/// Happy: `SLEEPX_SAY` accepts common spellings of "off", and empty.
+///
+/// Scenario: `SLEEPX_SAY=0`, or `SLEEPX_SAY=` left blank in a profile.
+/// Purpose: an empty value must behave like an unset variable, not an error.
+/// Means: set `0`, `no`, `off`, `false` and the empty string.
+/// Checks: exit 0 and no `say` warning.
+#[test]
+fn say_env_accepts_boolish_false_values_and_empty() {
+    for value in ["0", "no", "off", "false", ""] {
+        let (code, stderr) = run_with_say_env(value);
+        assert_eq!(code, Some(0), "SLEEPX_SAY={value:?}, stderr: {stderr}");
+        assert!(
+            !stderr.contains("`say`"),
+            "SLEEPX_SAY={value:?}, stderr: {stderr}"
+        );
+    }
+}
+
+/// Sad: an unrecognized `SLEEPX_SAY` value is a usage error.
+///
+/// Scenario: `SLEEPX_SAY=maybe`.
+/// Purpose: a typo should be reported, not silently read as off.
+/// Means: set `maybe`.
+/// Checks: exit 2 with an `error:` prefix.
+#[test]
+fn say_env_rejects_unrecognized_value() {
+    let (code, stderr) = run_with_say_env("maybe");
+    assert_eq!(code, Some(2), "stderr: {stderr}");
+    assert!(stderr.starts_with("error:"), "stderr: {stderr}");
+}

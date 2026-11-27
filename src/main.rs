@@ -55,7 +55,7 @@ struct Cli {
     color: ColorMode,
 
     /// Use macOS `say` to announce when done
-    #[arg(short = 's', long, env = "SLEEPX_SAY")]
+    #[arg(short = 's', long, env = "SLEEPX_SAY", value_parser = parse_bool_env)]
     say: bool,
 
     /// Min output interval in seconds for non-TTY mode
@@ -194,6 +194,16 @@ fn parse_interval(input: &str) -> Result<Duration, String> {
         return Err("must be positive".to_string());
     }
     Ok(interval)
+}
+
+/// Parses a boolean flag value from the environment. An empty value counts
+/// as unset, so `SLEEPX_SAY=` behaves like not setting it at all.
+fn parse_bool_env(input: &str) -> Result<bool, String> {
+    match input.to_ascii_lowercase().as_str() {
+        "" | "0" | "n" | "no" | "f" | "false" | "off" => Ok(false),
+        "1" | "y" | "yes" | "t" | "true" | "on" => Ok(true),
+        _ => Err("expected one of 1/0, yes/no, true/false, on/off".to_string()),
+    }
 }
 
 fn parse_single_char(input: &str) -> Result<String, String> {
@@ -812,6 +822,20 @@ mod tests {
         assert_eq!(
             parse_interval("1m"),
             Err("expected a number of seconds".to_string())
+        );
+    }
+
+    /// Sad: an unknown boolean word lists the accepted spellings.
+    ///
+    /// Scenario: `SLEEPX_SAY=maybe`.
+    /// Purpose: the user should learn which values work without reading docs.
+    /// Means: parse `maybe`.
+    /// Checks: the error lists 1/0, yes/no, true/false and on/off.
+    #[test]
+    fn parse_bool_env_rejects_unknown_words() {
+        assert_eq!(
+            parse_bool_env("maybe"),
+            Err("expected one of 1/0, yes/no, true/false, on/off".to_string())
         );
     }
 
