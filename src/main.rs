@@ -631,6 +631,13 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
+/// Writes the final line before dying by a signal. A write failure here is
+/// deliberately not an exit: the signal death that follows is how the caller
+/// learns what happened, and the terminal must still be restored first.
+fn write_last_words(out: &mut impl Write, text: &str) {
+    let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
+}
+
 /// Signals that end the sleep early.
 const STOP_SIGNALS: [i32; 3] = [SIGINT, SIGTERM, SIGHUP];
 
@@ -761,7 +768,7 @@ fn main() {
             } else {
                 format!("{output}\n")
             };
-            write_progress(&mut out, &line);
+            write_last_words(&mut out, &line);
             if let Some(ref orig) = orig_termios {
                 restore_termios(orig);
             }
@@ -807,9 +814,7 @@ fn main() {
         write_progress(&mut out, &format!("{done_msg}\n"));
     }
 
-    if say
-        && let Err(e) = Command::new(SAY_COMMAND).arg("Timer complete").spawn()
-    {
+    if say && let Err(e) = Command::new(SAY_COMMAND).arg("Timer complete").spawn() {
         eprintln!("warning: failed to run `{SAY_COMMAND}`: {e}");
     }
 }
@@ -918,7 +923,10 @@ mod tests {
     /// Checks: both are not found.
     #[test]
     fn find_in_path_misses_unknown_names_and_unset_path() {
-        assert!(!find_in_path("sleepx-no-such-tool", Some(OsStr::new("/bin"))));
+        assert!(!find_in_path(
+            "sleepx-no-such-tool",
+            Some(OsStr::new("/bin"))
+        ));
         assert!(!find_in_path("sh", None));
     }
 
@@ -1041,7 +1049,11 @@ mod tests {
     /// Checks: `5M` errors with a hint; `5m` is 300s; `1months` parses.
     #[test]
     fn parse_duration_rejects_uppercase_m_only() {
-        assert!(parse_duration("5M").unwrap_err().contains("'m' for minutes"));
+        assert!(
+            parse_duration("5M")
+                .unwrap_err()
+                .contains("'m' for minutes")
+        );
         assert_eq!(parse_duration("5m"), Ok(Duration::from_secs(300)));
         assert!(parse_duration("1months").is_ok());
     }

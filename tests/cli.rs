@@ -307,6 +307,37 @@ fn prints_final_progress_line_before_dying() {
     );
 }
 
+/// Sad: a signal still wins when the final line cannot be written.
+///
+/// Scenario: the terminal window is closed (SIGHUP, then writes fail), or
+/// Ctrl+C after `2>&1 | head -1` has already exited.
+/// Purpose: a failed write must not turn a signal death into exit 141 or 1,
+/// nor skip restoring the terminal.
+/// Means: read the first line, close the reader, then send TERM.
+/// Checks: the process is terminated by SIGTERM.
+#[test]
+fn dies_by_signal_even_when_final_line_cannot_be_written() {
+    let mut child = sleepx()
+        .arg("30")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn sleepx");
+    let mut reader = BufReader::new(child.stderr.take().expect("stderr is piped"));
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("read first progress line");
+    drop(reader);
+
+    let kill = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("run kill");
+    assert!(kill.success(), "kill -TERM failed");
+    let status = child.wait().expect("wait for sleepx");
+    assert_eq!(status.signal(), Some(15), "status: {status:?}");
+}
+
 // ---- environment variables ----
 
 /// Runs a short sleep with `SLEEPX_SAY` set and no `say` on PATH, so a true
