@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser};
 use terminal_size::{Width, terminal_size};
 
 /// A sleep command with an inline progress bar and countdown display.
@@ -17,30 +18,31 @@ use terminal_size::{Width, terminal_size};
 #[command(name = "sleepx", version, about)]
 struct Cli {
     /// Duration to sleep. Examples: 30, 1m30s, 2h5m
-    duration: String,
+    #[arg(value_parser = parse_duration)]
+    duration: Duration,
 
     /// Progress bar style: arrow, dot, block, hash
     #[arg(short = 'S', long, default_value = "arrow", env = "SLEEPX_STYLE")]
     style: BarStyle,
 
     /// Custom left bracket character (default: [)
-    #[arg(long, default_value = "[", env = "SLEEPX_BAR_LEFT")]
+    #[arg(long, default_value = "[", env = "SLEEPX_BAR_LEFT", value_parser = parse_single_char)]
     bar_left: String,
 
     /// Custom fill character (overrides --style)
-    #[arg(long, env = "SLEEPX_BAR_FILL")]
+    #[arg(long, env = "SLEEPX_BAR_FILL", value_parser = parse_single_char)]
     bar_fill: Option<String>,
 
     /// Custom tip character for progress indicator (e.g., >)
-    #[arg(long, env = "SLEEPX_BAR_TIP")]
+    #[arg(long, env = "SLEEPX_BAR_TIP", value_parser = parse_single_char)]
     bar_tip: Option<String>,
 
     /// Custom empty character (overrides --style)
-    #[arg(long, env = "SLEEPX_BAR_EMPTY")]
+    #[arg(long, env = "SLEEPX_BAR_EMPTY", value_parser = parse_single_char)]
     bar_empty: Option<String>,
 
     /// Custom right bracket character (default: ])
-    #[arg(long, default_value = "]", env = "SLEEPX_BAR_RIGHT")]
+    #[arg(long, default_value = "]", env = "SLEEPX_BAR_RIGHT", value_parser = parse_single_char)]
     bar_right: String,
 
     /// Progress bar visibility: auto (default), on, off
@@ -56,12 +58,12 @@ struct Cli {
     say: bool,
 
     /// Min output interval in seconds for non-TTY mode
-    #[arg(short = 'n', long, default_value = "1", env = "SLEEPX_MIN_INTERVAL")]
-    min_interval: f64,
+    #[arg(short = 'n', long, default_value = "1", env = "SLEEPX_MIN_INTERVAL", value_parser = parse_interval)]
+    min_interval: Duration,
 
     /// Max output interval in seconds for non-TTY mode
-    #[arg(short = 'x', long, default_value = "60", env = "SLEEPX_MAX_INTERVAL")]
-    max_interval: f64,
+    #[arg(short = 'x', long, default_value = "60", env = "SLEEPX_MAX_INTERVAL", value_parser = parse_interval)]
+    max_interval: Duration,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -154,17 +156,50 @@ struct BarChars {
     bar_right: String,
 }
 
+/// Converts seconds to a `Duration`, rejecting values `Duration` cannot hold.
+fn secs_to_duration(secs: f64) -> Result<Duration, String> {
+    if !secs.is_finite() {
+        return Err("must be a finite number".to_string());
+    }
+    if secs < 0.0 {
+        return Err("must not be negative".to_string());
+    }
+    Duration::try_from_secs_f64(secs).map_err(|_| "too large".to_string())
+}
+
 fn parse_duration(input: &str) -> Result<Duration, String> {
     // Try parsing as plain number (seconds)
     if let Ok(secs) = input.parse::<f64>() {
-        if secs < 0.0 {
-            return Err("Duration must not be negative".to_string());
-        }
-        return Ok(Duration::from_secs_f64(secs));
+        return secs_to_duration(secs);
     }
 
     // Try parsing as humantime format (e.g. 1m30s, 2h5m)
-    humantime::parse_duration(input).map_err(|e| format!("Invalid duration '{}': {}", input, e))
+    humantime::parse_duration(input).map_err(|_| {
+        "invalid duration (expected seconds like 30 or 1.5, or units like 1m30s, 2h)".to_string()
+    })
+}
+
+fn parse_interval(input: &str) -> Result<Duration, String> {
+    let secs: f64 = input
+        .parse()
+        .map_err(|_| "expected a number of seconds".to_string())?;
+    if secs.is_finite() && secs <= 0.0 {
+        return Err("must be positive".to_string());
+    }
+    // A positive value below 1ns still converts to a zero Duration, which
+    // would leave no gap between output lines.
+    let interval = secs_to_duration(secs)?;
+    if interval.is_zero() {
+        return Err("must be positive".to_string());
+    }
+    Ok(interval)
+}
+
+fn parse_single_char(input: &str) -> Result<String, String> {
+    if input.chars().count() != 1 {
+        return Err("must be a single character".to_string());
+    }
+    Ok(input.to_string())
 }
 
 fn hour_digits(total: Duration) -> usize {
@@ -438,58 +473,20 @@ fn restore_termios(original: &libc::termios) {
 fn main() {
     let cli = Cli::parse();
 
-    let total = match parse_duration(&cli.duration) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    if cli.min_interval <= 0.0 {
-        eprintln!("Error: --min-interval must be positive");
-        std::process::exit(1);
-    }
-    if cli.max_interval <= 0.0 {
-        eprintln!("Error: --max-interval must be positive");
-        std::process::exit(1);
-    }
-    if cli.min_interval > cli.max_interval {
-        eprintln!(
-            "Error: --min-interval ({}) must not exceed --max-interval ({})",
-            cli.min_interval, cli.max_interval
-        );
-        std::process::exit(1);
-    }
-
-    let min_interval = Duration::from_secs_f64(cli.min_interval);
-    let max_interval = Duration::from_secs_f64(cli.max_interval);
-
-    if let Some(ref f) = cli.bar_fill
-        && f.chars().count() != 1
-    {
-        eprintln!("Error: --bar-fill must be a single character");
-        std::process::exit(1);
-    }
-    if let Some(ref e) = cli.bar_empty
-        && e.chars().count() != 1
-    {
-        eprintln!("Error: --bar-empty must be a single character");
-        std::process::exit(1);
-    }
-    if cli.bar_left.chars().count() != 1 {
-        eprintln!("Error: --bar-left must be a single character");
-        std::process::exit(1);
-    }
-    if cli.bar_right.chars().count() != 1 {
-        eprintln!("Error: --bar-right must be a single character");
-        std::process::exit(1);
-    }
-    if let Some(ref t) = cli.bar_tip
-        && t.chars().count() != 1
-    {
-        eprintln!("Error: --bar-tip must be a single character");
-        std::process::exit(1);
+    let total = cli.duration;
+    let min_interval = cli.min_interval;
+    let max_interval = cli.max_interval;
+    if min_interval > max_interval {
+        Cli::command()
+            .error(
+                ErrorKind::ArgumentConflict,
+                format!(
+                    "--min-interval ({}s) must not exceed --max-interval ({}s)",
+                    min_interval.as_secs_f64(),
+                    max_interval.as_secs_f64()
+                ),
+            )
+            .exit();
     }
 
     let chars = BarChars {
@@ -654,13 +651,93 @@ mod tests {
         assert!(err.contains("negative"), "expected 'negative' in: {err}");
     }
 
+    /// Sad: text that is not a duration explains what is expected.
+    ///
+    /// Scenario: a user mistypes `sleepx abc`.
+    /// Purpose: clap prints this after "invalid value 'abc'", so it starts
+    /// lowercase and names valid forms instead of humantime internals.
+    /// Means: parse `abc`.
+    /// Checks: the error mentions "invalid duration" and an example form.
     #[test]
     fn parse_duration_invalid() {
         let err = parse_duration("abc").unwrap_err();
-        assert!(
-            err.contains("Invalid duration"),
-            "expected 'Invalid duration' in: {err}"
+        assert!(err.contains("invalid duration"), "got: {err}");
+        assert!(err.contains("1m30s"), "got: {err}");
+    }
+
+    /// Sad: non-finite seconds are rejected instead of panicking.
+    ///
+    /// Scenario: `sleepx inf` or `sleepx nan`.
+    /// Purpose: `Duration::from_secs_f64` panics on these values.
+    /// Means: parse `inf`, `-inf` and `nan`.
+    /// Checks: each error is "must be a finite number".
+    #[test]
+    fn parse_duration_rejects_non_finite() {
+        for input in ["inf", "-inf", "nan"] {
+            assert_eq!(
+                parse_duration(input),
+                Err("must be a finite number".to_string()),
+                "input: {input}"
+            );
+        }
+    }
+
+    /// Boundary: values beyond `Duration::MAX` are "too large".
+    ///
+    /// Scenario: `sleepx 1e30`.
+    /// Purpose: a finite but huge value must fail cleanly at the edge of the type.
+    /// Means: convert just below and above `Duration::MAX` (about 1.8447e19s).
+    /// Checks: 1.8e19 converts; 1.9e19 is "too large".
+    #[test]
+    fn secs_to_duration_rejects_values_beyond_duration_max() {
+        assert!(secs_to_duration(1.8e19).is_ok());
+        assert_eq!(secs_to_duration(1.9e19), Err("too large".to_string()));
+    }
+
+    /// Boundary: an interval must be at least one nanosecond.
+    ///
+    /// Scenario: `-n 1e-10 -x 1e-10`.
+    /// Purpose: positive values below 1ns become a zero Duration.
+    /// Means: parse values below, at and above 1ns, plus zero and negative.
+    /// Checks: 1e-10, 0 and -0.5 are "must be positive"; 1e-9 and 2e-9 convert.
+    #[test]
+    fn parse_interval_requires_at_least_one_nanosecond() {
+        for input in ["1e-10", "0", "-0.5"] {
+            assert_eq!(
+                parse_interval(input),
+                Err("must be positive".to_string()),
+                "input: {input}"
+            );
+        }
+        assert_eq!(parse_interval("1e-9"), Ok(Duration::from_nanos(1)));
+        assert_eq!(parse_interval("2e-9"), Ok(Duration::from_nanos(2)));
+    }
+
+    /// Sad: intervals take plain seconds, not humantime units.
+    ///
+    /// Scenario: `-n 1m`.
+    /// Purpose: the flag is documented in seconds; say so instead of guessing.
+    /// Means: parse `1m`.
+    /// Checks: "expected a number of seconds".
+    #[test]
+    fn parse_interval_rejects_non_numbers() {
+        assert_eq!(
+            parse_interval("1m"),
+            Err("expected a number of seconds".to_string())
         );
+    }
+
+    /// Boundary: bar characters count Unicode scalars, not bytes.
+    ///
+    /// Scenario: `--bar-fill ★` versus `--bar-fill ab` or an empty value.
+    /// Purpose: multi-byte characters must be accepted as one character.
+    /// Means: parse an empty string, one star, and two letters.
+    /// Checks: only the star is accepted.
+    #[test]
+    fn parse_single_char_counts_unicode_scalars() {
+        assert!(parse_single_char("").is_err());
+        assert_eq!(parse_single_char("★"), Ok("★".to_string()));
+        assert!(parse_single_char("ab").is_err());
     }
 
     // === hour_digits ===
