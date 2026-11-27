@@ -1,12 +1,13 @@
 use std::io::{self, IsTerminal, Write};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use terminal_size::{Width, terminal_size_of};
 
 /// A sleep command with an inline progress bar and countdown display.
@@ -473,6 +474,35 @@ fn render_done(total: Duration, chars: &BarChars, no_bar: bool, theme: &Theme) -
     )
 }
 
+/// Signals that end the sleep early.
+const STOP_SIGNALS: [i32; 3] = [SIGINT, SIGTERM, SIGHUP];
+
+/// Value of the stop flag while no stop signal has arrived.
+const NO_SIGNAL: usize = 0;
+
+/// Returns a flag that holds the number of the last stop signal received.
+fn install_stop_handlers() -> Arc<AtomicUsize> {
+    let received = Arc::new(AtomicUsize::new(NO_SIGNAL));
+    for signal in STOP_SIGNALS {
+        let value = usize::try_from(signal).expect("signal numbers are positive");
+        signal_hook::flag::register_usize(signal, Arc::clone(&received), value)
+            .unwrap_or_else(|err| panic!("failed to install handler for signal {signal}: {err}"));
+    }
+    received
+}
+
+/// Ends the process by the signal that stopped it, as if no handler had been
+/// installed. The parent shell then sees a death by that signal (status
+/// 128 + n), and wrapper scripts stop on the first Ctrl+C.
+fn die_by_signal(signal: usize) -> ! {
+    let signal = i32::try_from(signal).expect("signal numbers fit in i32");
+    if let Err(err) = signal_hook::low_level::emulate_default_handler(signal) {
+        eprintln!("warning: could not re-raise signal {signal}: {err}");
+    }
+    // Only reached if re-raising failed: fall back to the shell's status code.
+    std::process::exit(128 + signal);
+}
+
 /// Disable `ECHOCTL` so the terminal does not echo `^C` on Ctrl+C.
 /// Returns the original termios settings for later restoration.
 fn disable_echoctl() -> Option<libc::termios> {
@@ -529,13 +559,7 @@ fn main() {
         bar_right: cli.bar_right,
     };
 
-    // Handle Ctrl+C gracefully
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let interrupted_clone = interrupted.clone();
-    ctrlc::set_handler(move || {
-        interrupted_clone.store(true, Ordering::SeqCst);
-    })
-    .expect("Failed to set Ctrl+C handler");
+    let stop_signal = install_stop_handlers();
 
     let start = Instant::now();
     // Progress goes to stderr so stdout stays empty for callers that capture it.
@@ -562,7 +586,8 @@ fn main() {
     let mut prev_display_width: usize = 0;
 
     loop {
-        if interrupted.load(Ordering::SeqCst) {
+        let signal = stop_signal.load(Ordering::SeqCst);
+        if signal != NO_SIGNAL {
             let elapsed = start.elapsed().min(total);
             let output = render_progress(elapsed, total, &chars, no_bar, theme);
             let line = if is_tty {
@@ -575,12 +600,7 @@ fn main() {
             if let Some(ref orig) = orig_termios {
                 restore_termios(orig);
             }
-            // Re-raise SIGINT so the parent shell sees a signal death,
-            // not just a non-zero exit (avoids double Ctrl+C in wrappers).
-            unsafe {
-                libc::signal(libc::SIGINT, libc::SIG_DFL);
-                libc::raise(libc::SIGINT);
-            }
+            die_by_signal(signal);
         }
 
         let elapsed = start.elapsed();

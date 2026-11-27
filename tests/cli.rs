@@ -1,7 +1,8 @@
 //! End-to-end tests that run the compiled `sleepx` binary.
 
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Output, Stdio};
+use std::io::{BufRead, BufReader, Read};
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -240,4 +241,68 @@ fn exits_quietly_with_141_when_progress_reader_goes_away() {
 
     let status = child.wait().expect("wait for sleepx");
     assert_eq!(status.code(), Some(141), "first line: {first_line}");
+}
+
+// ---- signals ----
+
+/// Starts a long sleep, waits until it prints (so its signal handlers are
+/// installed), sends `signal` via kill(1), and returns the exit status and
+/// the rest of stderr.
+fn status_after_signal(signal: &str) -> (ExitStatus, String) {
+    let mut child = sleepx()
+        .arg("30")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn sleepx");
+    let mut reader = BufReader::new(child.stderr.take().expect("stderr is piped"));
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("read first progress line");
+
+    let kill = Command::new("kill")
+        .args([format!("-{signal}"), child.id().to_string()])
+        .status()
+        .expect("run kill");
+    assert!(kill.success(), "kill -{signal} failed");
+
+    let mut rest = String::new();
+    reader
+        .read_to_string(&mut rest)
+        .expect("read remaining stderr");
+    let status = child.wait().expect("wait for sleepx");
+    (status, rest)
+}
+
+/// Happy: sleepx dies by the same signal it received.
+///
+/// Scenario: Ctrl+C, `kill`, or closing the terminal during a sleep, inside a
+/// wrapper script that checks how its child ended.
+/// Purpose: dying by the real signal lets the shell report 130/143/129 and
+/// lets wrappers stop on the first Ctrl+C; re-raising SIGINT for every
+/// signal hid SIGTERM and SIGHUP.
+/// Means: send INT, HUP and TERM to a 30s sleep.
+/// Checks: the process is terminated by that signal, with no exit code.
+#[test]
+fn dies_by_the_signal_it_received() {
+    for (name, number) in [("INT", 2), ("HUP", 1), ("TERM", 15)] {
+        let (status, stderr) = status_after_signal(name);
+        assert_eq!(status.signal(), Some(number), "{name}, stderr: {stderr}");
+        assert_eq!(status.code(), None, "{name}, stderr: {stderr}");
+    }
+}
+
+/// Happy: the last progress line is printed before dying.
+///
+/// Scenario: a user presses Ctrl+C and wants to see how long it slept.
+/// Purpose: the final line records elapsed time at the moment of interrupt.
+/// Means: send INT to a 30s sleep and read the rest of stderr.
+/// Checks: stderr ends with a progress line showing the 30.0s total.
+#[test]
+fn prints_final_progress_line_before_dying() {
+    let (_, stderr) = status_after_signal("INT");
+    assert!(
+        stderr.trim_end().starts_with("30.0s - "),
+        "stderr: {stderr}"
+    );
 }
