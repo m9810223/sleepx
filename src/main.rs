@@ -172,24 +172,36 @@ fn hour_digits(total: Duration) -> usize {
     if h == 0 { 2 } else { (h.ilog10() as usize + 1).max(2) }
 }
 
+/// Width of the ".t" tenths suffix every format carries.
+const TENTHS_WIDTH: usize = 2;
+
+/// Drops everything below a tenth of a second.
+fn truncate_to_tenth(d: Duration) -> Duration {
+    let tenth_nanos = d.subsec_nanos() / 100_000_000 * 100_000_000;
+    Duration::new(d.as_secs(), tenth_nanos)
+}
+
+/// Formats `d` in the layout chosen by `total`, to a tenth of a second
+/// (truncated, so the display never runs ahead of real time).
 fn format_duration_fixed(d: Duration, total: Duration) -> String {
     let total_secs = total.as_secs();
     let secs = d.as_secs();
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     let s = secs % 60;
+    let tenths = d.subsec_millis() / 100;
 
     if total_secs >= 3600 {
         let w = hour_digits(total);
         let raw = format!("{:0>w$}:{:02}:{:02}", h, m, s);
-        prettify_duration(&raw)
+        format!("{}.{}", prettify_duration(&raw), tenths)
     } else if total_secs >= 60 {
         let raw = format!("{:02}:{:02}", m, s);
-        prettify_duration(&raw)
+        format!("{}.{}", prettify_duration(&raw), tenths)
     } else if total_secs >= 10 {
-        format!("{:2}s", s)
+        format!("{:2}.{}s", s, tenths)
     } else {
-        format!("{}s", s)
+        format!("{}.{}s", s, tenths)
     }
 }
 
@@ -217,11 +229,12 @@ fn prettify_duration(s: &str) -> String {
 
 fn duration_display_width(total: Duration) -> usize {
     let secs = total.as_secs();
-    if secs >= 3600 {
+    let whole = if secs >= 3600 {
         hour_digits(total) + 6 // H..H:MM:SS
     } else if secs >= 60 { 5 } // MM:SS
     else if secs >= 10 { 3 }   // NNs
-    else { 2 }                  // Ns
+    else { 2 };                 // Ns
+    whole + TENTHS_WIDTH
 }
 
 fn non_tty_interval(remaining: Duration, min: Duration, max: Duration) -> Duration {
@@ -273,14 +286,14 @@ fn render_progress(
         1.0
     };
 
-    // Truncate to whole seconds and derive remaining so the equation always holds
-    let total_secs = total.as_secs();
-    let elapsed_secs = elapsed.as_secs().min(total_secs);
-    let remaining_secs = total_secs - elapsed_secs;
+    // Truncate to tenths and derive remaining so the equation always holds
+    let total_shown = truncate_to_tenth(total);
+    let elapsed_shown = truncate_to_tenth(elapsed).min(total_shown);
+    let remaining_shown = total_shown - elapsed_shown;
 
-    let total_str = format_duration_fixed(total, total);
-    let elapsed_str = format_duration_fixed(Duration::from_secs(elapsed_secs), total);
-    let remaining_str = format_duration_fixed(Duration::from_secs(remaining_secs), total);
+    let total_str = format_duration_fixed(total_shown, total);
+    let elapsed_str = format_duration_fixed(elapsed_shown, total);
+    let remaining_str = format_duration_fixed(remaining_shown, total);
     let pct = progress * 100.0;
     let pct_str = format!("{:5.1}%", pct);
 
@@ -684,83 +697,117 @@ mod tests {
 
     // === format_duration_fixed ===
 
+    /// Asserts `format_duration_fixed(d, total)` for each `(d, expected)` row.
+    fn assert_formats(total: Duration, cases: &[(Duration, &str)]) {
+        for &(d, expected) in cases {
+            assert_eq!(
+                format_duration_fixed(d, total),
+                expected,
+                "d: {d:?}, total: {total:?}"
+            );
+        }
+    }
+
+    /// Happy: totals under 10s show seconds with one decimal.
+    ///
+    /// Scenario: a short `sleepx 9` countdown.
+    /// Purpose: the shortest format carries tenths without padding.
+    /// Means: format several values against a 9s total.
+    /// Checks: `0.0s`, `5.3s`, `9.0s`.
     #[test]
-    fn format_duration_fixed_short_total_single_digit() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(5), Duration::from_secs(9)),
-            "5s"
+    fn format_duration_fixed_single_digit_seconds_shows_tenths() {
+        assert_formats(
+            Duration::from_secs(9),
+            &[
+                (Duration::ZERO, "0.0s"),
+                (Duration::from_millis(5_300), "5.3s"),
+                (Duration::from_secs(9), "9.0s"),
+            ],
         );
     }
 
+    /// Happy: totals of 10s to 59s pad seconds to two digits, plus tenths.
+    ///
+    /// Scenario: `sleepx 30`, where values cross from one to two digits.
+    /// Purpose: fixed width keeps the line from shifting at 9.9s -> 10.0s.
+    /// Means: format several values against a 30s total.
+    /// Checks: ` 5.3s`, `12.0s`, `30.0s`.
     #[test]
-    fn format_duration_fixed_short_total_zero() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(0), Duration::from_secs(9)),
-            "0s"
+    fn format_duration_fixed_two_digit_seconds_shows_tenths() {
+        assert_formats(
+            Duration::from_secs(30),
+            &[
+                (Duration::from_millis(5_300), " 5.3s"),
+                (Duration::from_secs(12), "12.0s"),
+                (Duration::from_secs(30), "30.0s"),
+            ],
         );
     }
 
+    /// Happy: minute-range totals use M:SS.t with leading zeros blanked.
+    ///
+    /// Scenario: `sleepx 2m`.
+    /// Purpose: tenths follow the seconds field; prettified zeros stay blank.
+    /// Means: format zero, 65.3s and 120s against a 120s total.
+    /// Checks: `    0.0`, ` 1:05.3`, ` 2:00.0`.
     #[test]
-    fn format_duration_fixed_two_digit_seconds() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(5), Duration::from_secs(30)),
-            " 5s"
+    fn format_duration_fixed_minutes_shows_tenths() {
+        assert_formats(
+            Duration::from_secs(120),
+            &[
+                (Duration::ZERO, "    0.0"),
+                (Duration::from_millis(65_300), " 1:05.3"),
+                (Duration::from_secs(120), " 2:00.0"),
+            ],
         );
     }
 
+    /// Happy: hour-range totals use H:MM:SS.t with leading zeros blanked.
+    ///
+    /// Scenario: `sleepx 2h`.
+    /// Purpose: the longest format also carries tenths.
+    /// Means: format zero and 3661.3s against a 7200s total.
+    /// Checks: `       0.0`, ` 1:01:01.3`.
     #[test]
-    fn format_duration_fixed_two_digit_full() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(12), Duration::from_secs(30)),
-            "12s"
+    fn format_duration_fixed_hours_shows_tenths() {
+        assert_formats(
+            Duration::from_secs(7200),
+            &[
+                (Duration::ZERO, "       0.0"),
+                (Duration::from_millis(3_661_300), " 1:01:01.3"),
+            ],
         );
     }
 
-    #[test]
-    fn format_duration_fixed_minutes_range() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(65), Duration::from_secs(120)),
-            " 1:05"
-        );
-    }
-
-    #[test]
-    fn format_duration_fixed_minutes_zero() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(0), Duration::from_secs(120)),
-            "    0"
-        );
-    }
-
-    #[test]
-    fn format_duration_fixed_minutes_exact() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(120), Duration::from_secs(120)),
-            " 2:00"
-        );
-    }
-
-    #[test]
-    fn format_duration_fixed_hours_range() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(3661), Duration::from_secs(7200)),
-            " 1:01:01"
-        );
-    }
-
-    #[test]
-    fn format_duration_fixed_hours_zero() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(0), Duration::from_secs(7200)),
-            "       0"
-        );
-    }
-
+    /// Boundary: three-digit hours widen the hour field.
+    ///
+    /// Scenario: a 100-hour sleep.
+    /// Purpose: the hour field grows with the total instead of overflowing.
+    /// Means: format 100h against a 100h total.
+    /// Checks: `100:00:00.0`.
     #[test]
     fn format_duration_fixed_hundred_hours() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(360000), Duration::from_secs(360000)),
-            "100:00:00"
+        assert_formats(
+            Duration::from_secs(360_000),
+            &[(Duration::from_secs(360_000), "100:00:00.0")],
+        );
+    }
+
+    /// Boundary: tenths are truncated, never rounded up.
+    ///
+    /// Scenario: 12.39s have passed.
+    /// Purpose: the display must not run ahead of real time.
+    /// Means: format values just below, at and above a tenth boundary.
+    /// Checks: 12.299999999s -> `12.2s`, 12.3s -> `12.3s`, 12.399s -> `12.3s`.
+    #[test]
+    fn format_duration_fixed_truncates_tenths() {
+        assert_formats(
+            Duration::from_secs(30),
+            &[
+                (Duration::new(12, 299_999_999), "12.2s"),
+                (Duration::from_millis(12_300), "12.3s"),
+                (Duration::from_millis(12_399), "12.3s"),
+            ],
         );
     }
 
@@ -803,39 +850,84 @@ mod tests {
 
     // === duration_display_width ===
 
+    /// Boundary: display width steps up at 10s, 60s, 3600s and 100h totals.
+    ///
+    /// Scenario: the bar width is computed from how wide the times print.
+    /// Purpose: width must match `format_duration_fixed`, including ".t".
+    /// Means: check totals on both sides of each format boundary.
+    /// Checks: 9s->4, 10s->5, 59s->5, 60s->7, 3599s->7, 3600s->10, 100h->11.
     #[test]
-    fn duration_display_width_single_digit_seconds() {
-        assert_eq!(duration_display_width(Duration::from_secs(5)), 2);
+    fn duration_display_width_matches_formatted_width() {
+        let cases = [
+            (9, 4),
+            (10, 5),
+            (59, 5),
+            (60, 7),
+            (3_599, 7),
+            (3_600, 10),
+            (360_000, 11),
+        ];
+        for (secs, expected) in cases {
+            let total = Duration::from_secs(secs);
+            assert_eq!(duration_display_width(total), expected, "total: {secs}s");
+            assert_eq!(
+                format_duration_fixed(total, total).len(),
+                expected,
+                "formatted width for total: {secs}s"
+            );
+        }
     }
 
+    // === render_progress ===
+
+    /// Happy: total minus remaining equals elapsed, to the tenth.
+    ///
+    /// Scenario: 12.34s into `sleepx 30` with the bar off.
+    /// Purpose: the equation layout must stay arithmetically true with tenths.
+    /// Means: render without bar or color at 12.34s of 30s.
+    /// Checks: `30.0s - 17.7s = 12.3s  41.1%`.
     #[test]
-    fn duration_display_width_two_digit_seconds() {
-        assert_eq!(duration_display_width(Duration::from_secs(10)), 3);
+    fn render_progress_equation_holds_in_tenths() {
+        let chars = BarChars {
+            fill: "#".to_string(),
+            empty: "-".to_string(),
+            tip: None,
+            bar_left: "[".to_string(),
+            bar_right: "]".to_string(),
+        };
+        let line = render_progress(
+            Duration::from_millis(12_340),
+            Duration::from_secs(30),
+            &chars,
+            true,
+            &NO_COLOR,
+        );
+        assert_eq!(line, "30.0s - 17.7s = 12.3s  41.1%");
     }
 
+    /// Boundary: a total that is not a whole number of tenths still balances.
+    ///
+    /// Scenario: `sleepx 0.35`, 0.34s in.
+    /// Purpose: total is truncated like elapsed, so remaining never goes negative.
+    /// Means: render without bar or color at 0.34s of 0.35s.
+    /// Checks: `0.3s - 0.0s = 0.3s`.
     #[test]
-    fn duration_display_width_thirty_seconds() {
-        assert_eq!(duration_display_width(Duration::from_secs(30)), 3);
-    }
-
-    #[test]
-    fn duration_display_width_one_minute() {
-        assert_eq!(duration_display_width(Duration::from_secs(60)), 5);
-    }
-
-    #[test]
-    fn duration_display_width_under_one_hour() {
-        assert_eq!(duration_display_width(Duration::from_secs(3599)), 5);
-    }
-
-    #[test]
-    fn duration_display_width_one_hour() {
-        assert_eq!(duration_display_width(Duration::from_secs(3600)), 8);
-    }
-
-    #[test]
-    fn duration_display_width_hundred_hours() {
-        assert_eq!(duration_display_width(Duration::from_secs(360000)), 9);
+    fn render_progress_truncates_total_like_elapsed() {
+        let chars = BarChars {
+            fill: "#".to_string(),
+            empty: "-".to_string(),
+            tip: None,
+            bar_left: "[".to_string(),
+            bar_right: "]".to_string(),
+        };
+        let line = render_progress(
+            Duration::from_millis(340),
+            Duration::from_millis(350),
+            &chars,
+            true,
+            &NO_COLOR,
+        );
+        assert!(line.starts_with("0.3s - 0.0s = 0.3s"), "line: {line}");
     }
 
     // === non_tty_interval ===
