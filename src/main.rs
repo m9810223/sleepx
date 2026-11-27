@@ -1,67 +1,161 @@
+use std::env;
+use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
-use terminal_size::{Width, terminal_size};
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use terminal_size::{Width, terminal_size_of};
 
-/// A sleep command with an inline progress bar and countdown display.
+const EXAMPLES: &str = "\
+Examples:
+  sleepx 30                 Sleep 30 seconds
+  sleepx 1m 30s             Several durations are added together
+  sleepx 5m --say           Announce when done (macOS)
+  sleepx 1h 2>> build.log   Log one progress line per update";
+
+/// Sleep with an inline progress bar, shown as total - remaining = elapsed.
 ///
-/// In TTY mode, the progress bar overwrites the same line.
-/// In non-TTY mode (piped/redirected), outputs one line per update
-/// with no progress bar by default.
+/// Progress goes to stderr; stdout stays empty. When stderr is a terminal,
+/// one line is redrawn in place. Otherwise one line is printed per update,
+/// without a bar unless --bar on is given.
 #[derive(Parser)]
-#[command(name = "sleepx", version, about)]
+#[command(name = "sleepx", version, after_help = EXAMPLES)]
 struct Cli {
-    /// Duration to sleep. Examples: 30, 1m30s, 2h5m
-    duration: String,
+    /// Duration to sleep; several are added together (30, 1.5, 1m30s, 2h)
+    #[arg(
+        value_parser = parse_duration,
+        required = true,
+        num_args = 1..,
+        allow_negative_numbers = true
+    )]
+    duration: Vec<Duration>,
 
-    /// Progress bar style: arrow, dot, block, hash
-    #[arg(short = 'S', long, default_value = "arrow", env = "SLEEPX_STYLE")]
+    /// Progress bar style
+    #[arg(
+        short = 'S',
+        long,
+        default_value = "arrow",
+        env = "SLEEPX_STYLE",
+        hide_env_values = true
+    )]
     style: BarStyle,
 
-    /// Custom left bracket character (default: [)
-    #[arg(long, default_value = "[", env = "SLEEPX_BAR_LEFT")]
+    /// Left bracket character
+    #[arg(
+        long,
+        value_name = "CHAR",
+        default_value = "[",
+        env = "SLEEPX_BAR_LEFT",
+        hide_env_values = true,
+        value_parser = parse_single_char
+    )]
     bar_left: String,
 
-    /// Custom fill character (overrides --style)
-    #[arg(long, env = "SLEEPX_BAR_FILL")]
+    /// Fill character (overrides --style)
+    #[arg(
+        long,
+        value_name = "CHAR",
+        env = "SLEEPX_BAR_FILL",
+        hide_env_values = true,
+        value_parser = parse_single_char
+    )]
     bar_fill: Option<String>,
 
-    /// Custom tip character for progress indicator (e.g., >)
-    #[arg(long, env = "SLEEPX_BAR_TIP")]
+    /// Tip character at the head of the fill, e.g. >
+    #[arg(
+        long,
+        value_name = "CHAR",
+        env = "SLEEPX_BAR_TIP",
+        hide_env_values = true,
+        value_parser = parse_single_char
+    )]
     bar_tip: Option<String>,
 
-    /// Custom empty character (overrides --style)
-    #[arg(long, env = "SLEEPX_BAR_EMPTY")]
+    /// Empty character (overrides --style)
+    #[arg(
+        long,
+        value_name = "CHAR",
+        env = "SLEEPX_BAR_EMPTY",
+        hide_env_values = true,
+        value_parser = parse_single_char
+    )]
     bar_empty: Option<String>,
 
-    /// Custom right bracket character (default: ])
-    #[arg(long, default_value = "]", env = "SLEEPX_BAR_RIGHT")]
+    /// Right bracket character
+    #[arg(
+        long,
+        value_name = "CHAR",
+        default_value = "]",
+        env = "SLEEPX_BAR_RIGHT",
+        hide_env_values = true,
+        value_parser = parse_single_char
+    )]
     bar_right: String,
 
-    /// Progress bar visibility: auto (default), on, off
-    #[arg(short = 'b', long, default_value = "auto", env = "SLEEPX_BAR")]
+    /// Show the progress bar; auto shows it only when stderr is a terminal
+    #[arg(
+        short = 'b',
+        long,
+        default_value = "auto",
+        env = "SLEEPX_BAR",
+        hide_env_values = true
+    )]
     bar: BarVisibility,
 
-    /// Color output: auto (default, TTY only), on, off
-    #[arg(short = 'c', long, default_value = "auto", env = "SLEEPX_COLOR")]
+    /// Color output; auto colors only when stderr is a terminal
+    #[arg(
+        short = 'c',
+        long,
+        default_value = "auto",
+        env = "SLEEPX_COLOR",
+        hide_env_values = true
+    )]
     color: ColorMode,
 
-    /// Use macOS `say` to announce when done
-    #[arg(short = 's', long, env = "SLEEPX_SAY")]
+    /// Announce "Timer complete" with macOS `say` when done
+    #[arg(
+        short = 's',
+        long,
+        env = "SLEEPX_SAY",
+        hide_env_values = true,
+        value_parser = parse_bool_env
+    )]
     say: bool,
 
-    /// Min output interval in seconds for non-TTY mode
-    #[arg(short = 'n', long, default_value = "1", env = "SLEEPX_MIN_INTERVAL")]
-    min_interval: f64,
+    /// Shortest gap between lines when stderr is not a terminal
+    ///
+    /// The gap steps from 1s to 60s as more time remains, then is clamped
+    /// to --min-interval and --max-interval.
+    #[arg(
+        short = 'n',
+        long,
+        value_name = "SECONDS",
+        default_value = "1",
+        env = "SLEEPX_MIN_INTERVAL",
+        hide_env_values = true,
+        value_parser = parse_interval
+    )]
+    min_interval: Duration,
 
-    /// Max output interval in seconds for non-TTY mode
-    #[arg(short = 'x', long, default_value = "60", env = "SLEEPX_MAX_INTERVAL")]
-    max_interval: f64,
+    /// Longest gap between lines when stderr is not a terminal
+    #[arg(
+        short = 'x',
+        long,
+        value_name = "SECONDS",
+        default_value = "60",
+        env = "SLEEPX_MAX_INTERVAL",
+        hide_env_values = true,
+        value_parser = parse_interval
+    )]
+    max_interval: Duration,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -154,17 +248,75 @@ struct BarChars {
     bar_right: String,
 }
 
+/// Converts seconds to a `Duration`, rejecting values `Duration` cannot hold.
+fn secs_to_duration(secs: f64) -> Result<Duration, String> {
+    if !secs.is_finite() {
+        return Err("must be a finite number".to_string());
+    }
+    if secs < 0.0 {
+        return Err("must not be negative".to_string());
+    }
+    Duration::try_from_secs_f64(secs).map_err(|_| "too large".to_string())
+}
+
 fn parse_duration(input: &str) -> Result<Duration, String> {
     // Try parsing as plain number (seconds)
     if let Ok(secs) = input.parse::<f64>() {
-        if secs < 0.0 {
-            return Err("Duration must not be negative".to_string());
-        }
-        return Ok(Duration::from_secs_f64(secs));
+        return secs_to_duration(secs);
+    }
+
+    // humantime reads `M` as months; `5M` is almost always a typo for minutes.
+    if input.contains('M') {
+        return Err(
+            "ambiguous unit 'M' (months): use 'm' for minutes or 'months' for months".to_string(),
+        );
     }
 
     // Try parsing as humantime format (e.g. 1m30s, 2h5m)
-    humantime::parse_duration(input).map_err(|e| format!("Invalid duration '{}': {}", input, e))
+    humantime::parse_duration(input).map_err(|_| {
+        "invalid duration (expected seconds like 30 or 1.5, or units like 1m30s, 2h)".to_string()
+    })
+}
+
+/// Adds the durations together, as coreutils `sleep` does with several arguments.
+fn sum_durations(parts: &[Duration]) -> Result<Duration, String> {
+    parts
+        .iter()
+        .try_fold(Duration::ZERO, |acc, &d| acc.checked_add(d))
+        .ok_or_else(|| "total duration is too large".to_string())
+}
+
+fn parse_interval(input: &str) -> Result<Duration, String> {
+    let secs: f64 = input
+        .parse()
+        .map_err(|_| "expected a number of seconds".to_string())?;
+    if secs.is_finite() && secs <= 0.0 {
+        return Err("must be positive".to_string());
+    }
+    // A positive value below 1ns still converts to a zero Duration, which
+    // would leave no gap between output lines.
+    let interval = secs_to_duration(secs)?;
+    if interval.is_zero() {
+        return Err("must be positive".to_string());
+    }
+    Ok(interval)
+}
+
+/// Parses a boolean flag value from the environment. An empty value counts
+/// as unset, so `SLEEPX_SAY=` behaves like not setting it at all.
+fn parse_bool_env(input: &str) -> Result<bool, String> {
+    match input.to_ascii_lowercase().as_str() {
+        "" | "0" | "n" | "no" | "f" | "false" | "off" => Ok(false),
+        "1" | "y" | "yes" | "t" | "true" | "on" => Ok(true),
+        _ => Err("expected one of 1/0, yes/no, true/false, on/off".to_string()),
+    }
+}
+
+fn parse_single_char(input: &str) -> Result<String, String> {
+    if input.chars().count() != 1 {
+        return Err("must be a single character".to_string());
+    }
+    Ok(input.to_string())
 }
 
 fn hour_digits(total: Duration) -> usize {
@@ -172,24 +324,36 @@ fn hour_digits(total: Duration) -> usize {
     if h == 0 { 2 } else { (h.ilog10() as usize + 1).max(2) }
 }
 
+/// Width of the ".t" tenths suffix every format carries.
+const TENTHS_WIDTH: usize = 2;
+
+/// Drops everything below a tenth of a second.
+fn truncate_to_tenth(d: Duration) -> Duration {
+    let tenth_nanos = d.subsec_nanos() / 100_000_000 * 100_000_000;
+    Duration::new(d.as_secs(), tenth_nanos)
+}
+
+/// Formats `d` in the layout chosen by `total`, to a tenth of a second
+/// (truncated, so the display never runs ahead of real time).
 fn format_duration_fixed(d: Duration, total: Duration) -> String {
     let total_secs = total.as_secs();
     let secs = d.as_secs();
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     let s = secs % 60;
+    let tenths = d.subsec_millis() / 100;
 
     if total_secs >= 3600 {
         let w = hour_digits(total);
         let raw = format!("{:0>w$}:{:02}:{:02}", h, m, s);
-        prettify_duration(&raw)
+        format!("{}.{}", prettify_duration(&raw), tenths)
     } else if total_secs >= 60 {
         let raw = format!("{:02}:{:02}", m, s);
-        prettify_duration(&raw)
+        format!("{}.{}", prettify_duration(&raw), tenths)
     } else if total_secs >= 10 {
-        format!("{:2}s", s)
+        format!("{:2}.{}s", s, tenths)
     } else {
-        format!("{}s", s)
+        format!("{}.{}s", s, tenths)
     }
 }
 
@@ -217,11 +381,38 @@ fn prettify_duration(s: &str) -> String {
 
 fn duration_display_width(total: Duration) -> usize {
     let secs = total.as_secs();
-    if secs >= 3600 {
+    let whole = if secs >= 3600 {
         hour_digits(total) + 6 // H..H:MM:SS
     } else if secs >= 60 { 5 } // MM:SS
     else if secs >= 10 { 3 }   // NNs
-    else { 2 }                  // Ns
+    else { 2 };                 // Ns
+    whole + TENTHS_WIDTH
+}
+
+const NANOS_PER_SEC: u128 = 1_000_000_000;
+
+/// How often the loop wakes to check for signals and redraw.
+const TICK: Duration = Duration::from_millis(100);
+
+fn duration_from_nanos(nanos: u128) -> Duration {
+    let secs = u64::try_from(nanos / NANOS_PER_SEC).unwrap_or(u64::MAX);
+    let subsec = u32::try_from(nanos % NANOS_PER_SEC).expect("remainder is below 1e9");
+    Duration::new(secs, subsec)
+}
+
+/// Time until the next tick boundary (counted from the start), capped at the
+/// time left, so ticks do not drift and the sleep never overshoots the end.
+fn time_to_next_tick(elapsed: Duration, total: Duration) -> Duration {
+    let into_tick = duration_from_nanos(elapsed.as_nanos() % TICK.as_nanos());
+    (TICK - into_tick).min(total.saturating_sub(elapsed))
+}
+
+/// The first multiple of `interval` (counted from the start) after `elapsed`,
+/// so non-TTY lines land on round timestamps such as 5.0s, 10.0s, 15.0s.
+fn next_print_at(elapsed: Duration, interval: Duration) -> Duration {
+    let interval_nanos = interval.as_nanos();
+    let multiples = elapsed.as_nanos() / interval_nanos + 1;
+    duration_from_nanos(multiples.saturating_mul(interval_nanos))
 }
 
 fn non_tty_interval(remaining: Duration, min: Duration, max: Duration) -> Duration {
@@ -240,24 +431,50 @@ fn non_tty_interval(remaining: Duration, min: Duration, max: Duration) -> Durati
     base.clamp(min, max)
 }
 
+/// Usable width of the terminal behind stderr, where progress is drawn.
 fn get_terminal_width() -> usize {
-    terminal_size()
+    terminal_size_of(io::stderr())
         .map(|(Width(w), _)| (w as usize).saturating_sub(1))
         .unwrap_or(79)
 }
 
-/// Clear previously rendered output that may have wrapped across multiple lines.
-fn clear_wrapped_lines(prev_output_len: usize) {
-    let term_width = get_terminal_width();
+/// Escape sequence that returns to the start of the previous output, which
+/// may have wrapped across several rows, and clears from there to the end.
+fn clear_previous_output(prev_output_len: usize, term_width: usize) -> String {
+    let mut seq = String::new();
     if prev_output_len > 0 && term_width > 0 {
-        let lines = (prev_output_len + term_width - 1) / term_width;
+        let lines = prev_output_len.div_ceil(term_width);
         if lines > 1 {
             // Move cursor up to the first wrapped line
-            print!("\x1b[{}A", lines - 1);
+            seq.push_str(&format!("\x1b[{}A", lines - 1));
         }
     }
     // Return to column 1 and clear from cursor to end of display
-    print!("\r\x1b[J");
+    seq.push_str("\r\x1b[J");
+    seq
+}
+
+/// Exit status when the progress reader has gone away; this is what a shell
+/// reports for a process killed by SIGPIPE (128 + 13).
+const EXIT_BROKEN_PIPE: i32 = 141;
+
+/// Exit status for any other failure to write progress.
+const EXIT_WRITE_FAILED: i32 = 1;
+
+fn write_error_exit_code(err: &io::Error) -> i32 {
+    if err.kind() == io::ErrorKind::BrokenPipe {
+        EXIT_BROKEN_PIPE
+    } else {
+        EXIT_WRITE_FAILED
+    }
+}
+
+/// Writes progress text, exiting without a message if the stream is unusable:
+/// progress is the only output, so there is nowhere left to report the error.
+fn write_progress(out: &mut impl Write, text: &str) {
+    if let Err(err) = out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        std::process::exit(write_error_exit_code(&err));
+    }
 }
 
 fn render_progress(
@@ -273,14 +490,14 @@ fn render_progress(
         1.0
     };
 
-    // Truncate to whole seconds and derive remaining so the equation always holds
-    let total_secs = total.as_secs();
-    let elapsed_secs = elapsed.as_secs().min(total_secs);
-    let remaining_secs = total_secs - elapsed_secs;
+    // Truncate to tenths and derive remaining so the equation always holds
+    let total_shown = truncate_to_tenth(total);
+    let elapsed_shown = truncate_to_tenth(elapsed).min(total_shown);
+    let remaining_shown = total_shown - elapsed_shown;
 
-    let total_str = format_duration_fixed(total, total);
-    let elapsed_str = format_duration_fixed(Duration::from_secs(elapsed_secs), total);
-    let remaining_str = format_duration_fixed(Duration::from_secs(remaining_secs), total);
+    let total_str = format_duration_fixed(total_shown, total);
+    let elapsed_str = format_duration_fixed(elapsed_shown, total);
+    let remaining_str = format_duration_fixed(remaining_shown, total);
     let pct = progress * 100.0;
     let pct_str = format!("{:5.1}%", pct);
 
@@ -399,6 +616,57 @@ fn render_done(total: Duration, chars: &BarChars, no_bar: bool, theme: &Theme) -
     )
 }
 
+const SAY_COMMAND: &str = "say";
+
+/// Whether an executable file named `name` exists in one of the `path` dirs.
+fn find_in_path(name: &str, path: Option<&OsStr>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    env::split_paths(path).any(|dir| is_executable(&dir.join(name)))
+}
+
+fn is_executable(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// Writes the final line before dying by a signal. A write failure here is
+/// deliberately not an exit: the signal death that follows is how the caller
+/// learns what happened, and the terminal must still be restored first.
+fn write_last_words(out: &mut impl Write, text: &str) {
+    let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
+}
+
+/// Signals that end the sleep early.
+const STOP_SIGNALS: [i32; 3] = [SIGINT, SIGTERM, SIGHUP];
+
+/// Value of the stop flag while no stop signal has arrived.
+const NO_SIGNAL: usize = 0;
+
+/// Returns a flag that holds the number of the last stop signal received.
+fn install_stop_handlers() -> Arc<AtomicUsize> {
+    let received = Arc::new(AtomicUsize::new(NO_SIGNAL));
+    for signal in STOP_SIGNALS {
+        let value = usize::try_from(signal).expect("signal numbers are positive");
+        signal_hook::flag::register_usize(signal, Arc::clone(&received), value)
+            .unwrap_or_else(|err| panic!("failed to install handler for signal {signal}: {err}"));
+    }
+    received
+}
+
+/// Ends the process by the signal that stopped it, as if no handler had been
+/// installed. The parent shell then sees a death by that signal (status
+/// 128 + n), and wrapper scripts stop on the first Ctrl+C.
+fn die_by_signal(signal: usize) -> ! {
+    let signal = i32::try_from(signal).expect("signal numbers fit in i32");
+    if let Err(err) = signal_hook::low_level::emulate_default_handler(signal) {
+        eprintln!("warning: could not re-raise signal {signal}: {err}");
+    }
+    // Only reached if re-raising failed: fall back to the shell's status code.
+    std::process::exit(128 + signal);
+}
+
 /// Disable `ECHOCTL` so the terminal does not echo `^C` on Ctrl+C.
 /// Returns the original termios settings for later restoration.
 fn disable_echoctl() -> Option<libc::termios> {
@@ -425,58 +693,21 @@ fn restore_termios(original: &libc::termios) {
 fn main() {
     let cli = Cli::parse();
 
-    let total = match parse_duration(&cli.duration) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    if cli.min_interval <= 0.0 {
-        eprintln!("Error: --min-interval must be positive");
-        std::process::exit(1);
-    }
-    if cli.max_interval <= 0.0 {
-        eprintln!("Error: --max-interval must be positive");
-        std::process::exit(1);
-    }
-    if cli.min_interval > cli.max_interval {
-        eprintln!(
-            "Error: --min-interval ({}) must not exceed --max-interval ({})",
-            cli.min_interval, cli.max_interval
-        );
-        std::process::exit(1);
-    }
-
-    let min_interval = Duration::from_secs_f64(cli.min_interval);
-    let max_interval = Duration::from_secs_f64(cli.max_interval);
-
-    if let Some(ref f) = cli.bar_fill
-        && f.chars().count() != 1
-    {
-        eprintln!("Error: --bar-fill must be a single character");
-        std::process::exit(1);
-    }
-    if let Some(ref e) = cli.bar_empty
-        && e.chars().count() != 1
-    {
-        eprintln!("Error: --bar-empty must be a single character");
-        std::process::exit(1);
-    }
-    if cli.bar_left.chars().count() != 1 {
-        eprintln!("Error: --bar-left must be a single character");
-        std::process::exit(1);
-    }
-    if cli.bar_right.chars().count() != 1 {
-        eprintln!("Error: --bar-right must be a single character");
-        std::process::exit(1);
-    }
-    if let Some(ref t) = cli.bar_tip
-        && t.chars().count() != 1
-    {
-        eprintln!("Error: --bar-tip must be a single character");
-        std::process::exit(1);
+    let total = sum_durations(&cli.duration)
+        .unwrap_or_else(|msg| Cli::command().error(ErrorKind::ValueValidation, msg).exit());
+    let min_interval = cli.min_interval;
+    let max_interval = cli.max_interval;
+    if min_interval > max_interval {
+        Cli::command()
+            .error(
+                ErrorKind::ArgumentConflict,
+                format!(
+                    "--min-interval ({}s) must not exceed --max-interval ({}s)",
+                    min_interval.as_secs_f64(),
+                    max_interval.as_secs_f64()
+                ),
+            )
+            .exit();
     }
 
     let chars = BarChars {
@@ -493,16 +724,19 @@ fn main() {
         bar_right: cli.bar_right,
     };
 
-    // Handle Ctrl+C gracefully
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let interrupted_clone = interrupted.clone();
-    ctrlc::set_handler(move || {
-        interrupted_clone.store(true, Ordering::SeqCst);
-    })
-    .expect("Failed to set Ctrl+C handler");
+    let stop_signal = install_stop_handlers();
+
+    // Check up front, so a missing `say` is reported now rather than after
+    // the whole sleep. It stays a warning: the sleep itself still works.
+    let say = cli.say && find_in_path(SAY_COMMAND, env::var_os("PATH").as_deref());
+    if cli.say && !say {
+        eprintln!("warning: `{SAY_COMMAND}` not found in PATH; --say is ignored");
+    }
 
     let start = Instant::now();
-    let is_tty = io::stdout().is_terminal();
+    // Progress goes to stderr so stdout stays empty for callers that capture it.
+    let mut out = io::stderr();
+    let is_tty = out.is_terminal();
     let orig_termios = if is_tty { disable_echoctl() } else { None };
     let no_bar = match cli.bar {
         BarVisibility::On => false,
@@ -520,29 +754,25 @@ fn main() {
             }
         }
     };
-    let mut last_print = Instant::now() - Duration::from_secs(9999); // force first print
+    let mut next_print = Duration::ZERO;
     let mut prev_display_width: usize = 0;
 
     loop {
-        if interrupted.load(Ordering::SeqCst) {
+        let signal = stop_signal.load(Ordering::SeqCst);
+        if signal != NO_SIGNAL {
             let elapsed = start.elapsed().min(total);
             let output = render_progress(elapsed, total, &chars, no_bar, theme);
-            if is_tty {
-                clear_wrapped_lines(prev_display_width);
-                print!("{}\x1b[K\n", output);
+            let line = if is_tty {
+                let clear = clear_previous_output(prev_display_width, get_terminal_width());
+                format!("{clear}{output}\x1b[K\n")
             } else {
-                println!("{}", output);
-            }
-            io::stdout().flush().ok();
+                format!("{output}\n")
+            };
+            write_last_words(&mut out, &line);
             if let Some(ref orig) = orig_termios {
                 restore_termios(orig);
             }
-            // Re-raise SIGINT so the parent shell sees a signal death,
-            // not just a non-zero exit (avoids double Ctrl+C in wrappers).
-            unsafe {
-                libc::signal(libc::SIGINT, libc::SIG_DFL);
-                libc::raise(libc::SIGINT);
-            }
+            die_by_signal(signal);
         }
 
         let elapsed = start.elapsed();
@@ -553,26 +783,21 @@ fn main() {
 
         if is_tty {
             let output = render_progress(elapsed, total, &chars, no_bar, theme);
-            clear_wrapped_lines(prev_display_width);
-            print!("{}\x1b[K", output);
-            io::stdout().flush().ok();
+            let clear = clear_previous_output(prev_display_width, get_terminal_width());
+            write_progress(&mut out, &format!("{clear}{output}\x1b[K"));
             prev_display_width = if no_bar {
                 output.len()
             } else {
                 get_terminal_width()
             };
-            thread::sleep(Duration::from_millis(100));
-        } else {
+        } else if elapsed >= next_print {
+            let output = render_progress(elapsed, total, &chars, no_bar, theme);
+            write_progress(&mut out, &format!("{output}\n"));
             let remaining = total.saturating_sub(elapsed);
             let interval = non_tty_interval(remaining, min_interval, max_interval);
-
-            if last_print.elapsed() >= interval {
-                let output = render_progress(elapsed, total, &chars, no_bar, theme);
-                println!("{}", output);
-                last_print = Instant::now();
-            }
-            thread::sleep(Duration::from_millis(100));
+            next_print = next_print_at(elapsed, interval);
         }
+        thread::sleep(time_to_next_tick(elapsed, total));
     }
 
     if let Some(ref orig) = orig_termios {
@@ -583,18 +808,14 @@ fn main() {
     let done_msg = render_done(total, &chars, no_bar, theme);
 
     if is_tty {
-        clear_wrapped_lines(prev_display_width);
-        print!("{}\x1b[K\n", done_msg);
+        let clear = clear_previous_output(prev_display_width, get_terminal_width());
+        write_progress(&mut out, &format!("{clear}{done_msg}\x1b[K\n"));
     } else {
-        println!("{}", done_msg);
+        write_progress(&mut out, &format!("{done_msg}\n"));
     }
-    io::stdout().flush().ok();
 
-    // macOS say
-    if cli.say
-        && let Err(e) = Command::new("say").arg("Timer complete").spawn()
-    {
-        eprintln!("Warning: failed to run `say`: {}", e);
+    if say && let Err(e) = Command::new(SAY_COMMAND).arg("Timer complete").spawn() {
+        eprintln!("warning: failed to run `{SAY_COMMAND}`: {e}");
     }
 }
 
@@ -602,6 +823,154 @@ fn main() {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // === scheduling ===
+
+    /// Boundary: sleeps end on 100ms boundaries counted from the start.
+    ///
+    /// Scenario: the loop wakes a little late after each check.
+    /// Purpose: a fixed 100ms sleep let lateness pile up (0.25s took ~0.32s).
+    /// Means: elapsed at 0, just before, at and just after the 200ms boundary.
+    /// Checks: 100ms, 1ns, 100ms, 99.999999ms.
+    #[test]
+    fn time_to_next_tick_aligns_to_tick_boundaries() {
+        let total = Duration::from_secs(10);
+        let cases = [
+            (Duration::ZERO, Duration::from_millis(100)),
+            (Duration::new(0, 199_999_999), Duration::from_nanos(1)),
+            (Duration::from_millis(200), Duration::from_millis(100)),
+            (Duration::new(0, 200_000_001), Duration::new(0, 99_999_999)),
+        ];
+        for (elapsed, expected) in cases {
+            assert_eq!(
+                time_to_next_tick(elapsed, total),
+                expected,
+                "elapsed: {elapsed:?}"
+            );
+        }
+    }
+
+    /// Boundary: the last sleep stops at the end, not at the next tick.
+    ///
+    /// Scenario: `sleepx 0.25`, 200ms in.
+    /// Purpose: never sleep past the requested duration.
+    /// Means: 200ms elapsed of 250ms.
+    /// Checks: 50ms.
+    #[test]
+    fn time_to_next_tick_never_sleeps_past_the_end() {
+        assert_eq!(
+            time_to_next_tick(Duration::from_millis(200), Duration::from_millis(250)),
+            Duration::from_millis(50)
+        );
+    }
+
+    /// Boundary: the next non-TTY line lands on the next multiple of the interval.
+    ///
+    /// Scenario: logging every second; a check runs slightly late.
+    /// Purpose: timestamps stay on round values (1.0s, 2.0s) instead of drifting.
+    /// Means: elapsed at 0, just before, at and just after 1s, interval 1s.
+    /// Checks: 1s, 1s, 2s, 2s.
+    #[test]
+    fn next_print_at_is_the_following_multiple_of_the_interval() {
+        let interval = Duration::from_secs(1);
+        let cases = [
+            (Duration::ZERO, Duration::from_secs(1)),
+            (Duration::new(0, 999_999_999), Duration::from_secs(1)),
+            (Duration::from_secs(1), Duration::from_secs(2)),
+            (Duration::new(1, 1), Duration::from_secs(2)),
+        ];
+        for (elapsed, expected) in cases {
+            assert_eq!(
+                next_print_at(elapsed, interval),
+                expected,
+                "elapsed: {elapsed:?}"
+            );
+        }
+    }
+
+    /// Happy: a late check skips the multiples it already missed.
+    ///
+    /// Scenario: the interval just grew from 1s to 5s at 10.05s.
+    /// Purpose: the next line is scheduled ahead, not in the past.
+    /// Means: elapsed 10.05s, interval 5s.
+    /// Checks: 15s.
+    #[test]
+    fn next_print_at_skips_missed_multiples() {
+        assert_eq!(
+            next_print_at(Duration::from_millis(10_050), Duration::from_secs(5)),
+            Duration::from_secs(15)
+        );
+    }
+
+    // === say lookup ===
+
+    /// Happy: an executable is found in a later PATH entry.
+    ///
+    /// Scenario: PATH lists a missing directory before the one with the tool.
+    /// Purpose: lookup must walk every entry, not stop at the first.
+    /// Means: look for `sh` in "/nonexistent:/bin".
+    /// Checks: found.
+    #[test]
+    fn find_in_path_finds_an_executable_in_a_later_entry() {
+        assert!(find_in_path("sh", Some(OsStr::new("/nonexistent:/bin"))));
+    }
+
+    /// Sad: unknown names and an unset PATH find nothing.
+    ///
+    /// Scenario: `--say` on a system without `say`, or with PATH unset.
+    /// Purpose: either case must report "not found" rather than error out.
+    /// Means: look for a made-up name in /bin, and for `sh` with no PATH.
+    /// Checks: both are not found.
+    #[test]
+    fn find_in_path_misses_unknown_names_and_unset_path() {
+        assert!(!find_in_path(
+            "sleepx-no-such-tool",
+            Some(OsStr::new("/bin"))
+        ));
+        assert!(!find_in_path("sh", None));
+    }
+
+    // === output helpers ===
+
+    /// Boundary: output that fits one row needs no cursor-up.
+    ///
+    /// Scenario: redrawing a progress line in an 80-column terminal.
+    /// Purpose: moving up when nothing wrapped would erase the line above.
+    /// Means: previous lengths of 0 and exactly the terminal width.
+    /// Checks: both give only "return and clear".
+    #[test]
+    fn clear_previous_output_without_wrapping() {
+        assert_eq!(clear_previous_output(0, 80), "\r\x1b[J");
+        assert_eq!(clear_previous_output(80, 80), "\r\x1b[J");
+    }
+
+    /// Boundary: one column past the width means one wrapped row.
+    ///
+    /// Scenario: the window was narrowed below the previous line's length.
+    /// Purpose: the cursor must climb to the first row of the old output.
+    /// Means: previous lengths of 81 and 160 at width 80, and 161.
+    /// Checks: 81 and 160 move up 1 row; 161 moves up 2.
+    #[test]
+    fn clear_previous_output_climbs_wrapped_rows() {
+        assert_eq!(clear_previous_output(81, 80), "\x1b[1A\r\x1b[J");
+        assert_eq!(clear_previous_output(160, 80), "\x1b[1A\r\x1b[J");
+        assert_eq!(clear_previous_output(161, 80), "\x1b[2A\r\x1b[J");
+    }
+
+    /// Sad: a write error maps to an exit status by its kind.
+    ///
+    /// Scenario: the progress reader closed the pipe, or the log disk is full.
+    /// Purpose: a closed pipe should look like a SIGPIPE death (141); other
+    /// failures exit 1.
+    /// Means: classify a BrokenPipe and a PermissionDenied error.
+    /// Checks: 141 and 1.
+    #[test]
+    fn write_error_exit_code_distinguishes_broken_pipe() {
+        let broken = io::Error::from(io::ErrorKind::BrokenPipe);
+        let other = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(write_error_exit_code(&broken), 141);
+        assert_eq!(write_error_exit_code(&other), 1);
+    }
 
     // === parse_duration ===
 
@@ -641,13 +1010,155 @@ mod tests {
         assert!(err.contains("negative"), "expected 'negative' in: {err}");
     }
 
+    /// Sad: text that is not a duration explains what is expected.
+    ///
+    /// Scenario: a user mistypes `sleepx abc`.
+    /// Purpose: clap prints this after "invalid value 'abc'", so it starts
+    /// lowercase and names valid forms instead of humantime internals.
+    /// Means: parse `abc`.
+    /// Checks: the error mentions "invalid duration" and an example form.
     #[test]
     fn parse_duration_invalid() {
         let err = parse_duration("abc").unwrap_err();
+        assert!(err.contains("invalid duration"), "got: {err}");
+        assert!(err.contains("1m30s"), "got: {err}");
+    }
+
+    /// Sad: non-finite seconds are rejected instead of panicking.
+    ///
+    /// Scenario: `sleepx inf` or `sleepx nan`.
+    /// Purpose: `Duration::from_secs_f64` panics on these values.
+    /// Means: parse `inf`, `-inf` and `nan`.
+    /// Checks: each error is "must be a finite number".
+    #[test]
+    fn parse_duration_rejects_non_finite() {
+        for input in ["inf", "-inf", "nan"] {
+            assert_eq!(
+                parse_duration(input),
+                Err("must be a finite number".to_string()),
+                "input: {input}"
+            );
+        }
+    }
+
+    /// Sad: uppercase `M` is rejected; minutes and spelled-out months still parse.
+    ///
+    /// Scenario: `sleepx 5M` meant as five minutes.
+    /// Purpose: humantime reads `M` as months; only the ambiguous form is refused.
+    /// Means: parse `5M`, `5m` and `1months`.
+    /// Checks: `5M` errors with a hint; `5m` is 300s; `1months` parses.
+    #[test]
+    fn parse_duration_rejects_uppercase_m_only() {
         assert!(
-            err.contains("Invalid duration"),
-            "expected 'Invalid duration' in: {err}"
+            parse_duration("5M")
+                .unwrap_err()
+                .contains("'m' for minutes")
         );
+        assert_eq!(parse_duration("5m"), Ok(Duration::from_secs(300)));
+        assert!(parse_duration("1months").is_ok());
+    }
+
+    /// Happy: durations are summed, one or many.
+    ///
+    /// Scenario: `sleepx 0.5` versus `sleepx 0.5 0.5 0.5`.
+    /// Purpose: summing must also work for a single argument.
+    /// Means: sum one and three half-second values.
+    /// Checks: 0.5s and 1.5s.
+    #[test]
+    fn sum_durations_adds_one_or_many() {
+        let half = Duration::from_millis(500);
+        assert_eq!(sum_durations(&[half]), Ok(half));
+        assert_eq!(
+            sum_durations(&[half, half, half]),
+            Ok(Duration::from_millis(1500))
+        );
+    }
+
+    /// Boundary: the sum may reach `Duration::MAX` but not exceed it.
+    ///
+    /// Scenario: very large arguments that only overflow together.
+    /// Purpose: overflow must be reported, not wrap or panic.
+    /// Means: sum `MAX` alone, and `MAX` plus one nanosecond.
+    /// Checks: `MAX` is accepted; `MAX + 1ns` is "total duration is too large".
+    #[test]
+    fn sum_durations_reports_overflow() {
+        assert_eq!(sum_durations(&[Duration::MAX]), Ok(Duration::MAX));
+        assert_eq!(
+            sum_durations(&[Duration::MAX, Duration::from_nanos(1)]),
+            Err("total duration is too large".to_string())
+        );
+    }
+
+    /// Boundary: values beyond `Duration::MAX` are "too large".
+    ///
+    /// Scenario: `sleepx 1e30`.
+    /// Purpose: a finite but huge value must fail cleanly at the edge of the type.
+    /// Means: convert just below and above `Duration::MAX` (about 1.8447e19s).
+    /// Checks: 1.8e19 converts; 1.9e19 is "too large".
+    #[test]
+    fn secs_to_duration_rejects_values_beyond_duration_max() {
+        assert!(secs_to_duration(1.8e19).is_ok());
+        assert_eq!(secs_to_duration(1.9e19), Err("too large".to_string()));
+    }
+
+    /// Boundary: an interval must be at least one nanosecond.
+    ///
+    /// Scenario: `-n 1e-10 -x 1e-10`.
+    /// Purpose: positive values below 1ns become a zero Duration.
+    /// Means: parse values below, at and above 1ns, plus zero and negative.
+    /// Checks: 1e-10, 0 and -0.5 are "must be positive"; 1e-9 and 2e-9 convert.
+    #[test]
+    fn parse_interval_requires_at_least_one_nanosecond() {
+        for input in ["1e-10", "0", "-0.5"] {
+            assert_eq!(
+                parse_interval(input),
+                Err("must be positive".to_string()),
+                "input: {input}"
+            );
+        }
+        assert_eq!(parse_interval("1e-9"), Ok(Duration::from_nanos(1)));
+        assert_eq!(parse_interval("2e-9"), Ok(Duration::from_nanos(2)));
+    }
+
+    /// Sad: intervals take plain seconds, not humantime units.
+    ///
+    /// Scenario: `-n 1m`.
+    /// Purpose: the flag is documented in seconds; say so instead of guessing.
+    /// Means: parse `1m`.
+    /// Checks: "expected a number of seconds".
+    #[test]
+    fn parse_interval_rejects_non_numbers() {
+        assert_eq!(
+            parse_interval("1m"),
+            Err("expected a number of seconds".to_string())
+        );
+    }
+
+    /// Sad: an unknown boolean word lists the accepted spellings.
+    ///
+    /// Scenario: `SLEEPX_SAY=maybe`.
+    /// Purpose: the user should learn which values work without reading docs.
+    /// Means: parse `maybe`.
+    /// Checks: the error lists 1/0, yes/no, true/false and on/off.
+    #[test]
+    fn parse_bool_env_rejects_unknown_words() {
+        assert_eq!(
+            parse_bool_env("maybe"),
+            Err("expected one of 1/0, yes/no, true/false, on/off".to_string())
+        );
+    }
+
+    /// Boundary: bar characters count Unicode scalars, not bytes.
+    ///
+    /// Scenario: `--bar-fill ★` versus `--bar-fill ab` or an empty value.
+    /// Purpose: multi-byte characters must be accepted as one character.
+    /// Means: parse an empty string, one star, and two letters.
+    /// Checks: only the star is accepted.
+    #[test]
+    fn parse_single_char_counts_unicode_scalars() {
+        assert!(parse_single_char("").is_err());
+        assert_eq!(parse_single_char("★"), Ok("★".to_string()));
+        assert!(parse_single_char("ab").is_err());
     }
 
     // === hour_digits ===
@@ -684,83 +1195,117 @@ mod tests {
 
     // === format_duration_fixed ===
 
+    /// Asserts `format_duration_fixed(d, total)` for each `(d, expected)` row.
+    fn assert_formats(total: Duration, cases: &[(Duration, &str)]) {
+        for &(d, expected) in cases {
+            assert_eq!(
+                format_duration_fixed(d, total),
+                expected,
+                "d: {d:?}, total: {total:?}"
+            );
+        }
+    }
+
+    /// Happy: totals under 10s show seconds with one decimal.
+    ///
+    /// Scenario: a short `sleepx 9` countdown.
+    /// Purpose: the shortest format carries tenths without padding.
+    /// Means: format several values against a 9s total.
+    /// Checks: `0.0s`, `5.3s`, `9.0s`.
     #[test]
-    fn format_duration_fixed_short_total_single_digit() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(5), Duration::from_secs(9)),
-            "5s"
+    fn format_duration_fixed_single_digit_seconds_shows_tenths() {
+        assert_formats(
+            Duration::from_secs(9),
+            &[
+                (Duration::ZERO, "0.0s"),
+                (Duration::from_millis(5_300), "5.3s"),
+                (Duration::from_secs(9), "9.0s"),
+            ],
         );
     }
 
+    /// Happy: totals of 10s to 59s pad seconds to two digits, plus tenths.
+    ///
+    /// Scenario: `sleepx 30`, where values cross from one to two digits.
+    /// Purpose: fixed width keeps the line from shifting at 9.9s -> 10.0s.
+    /// Means: format several values against a 30s total.
+    /// Checks: ` 5.3s`, `12.0s`, `30.0s`.
     #[test]
-    fn format_duration_fixed_short_total_zero() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(0), Duration::from_secs(9)),
-            "0s"
+    fn format_duration_fixed_two_digit_seconds_shows_tenths() {
+        assert_formats(
+            Duration::from_secs(30),
+            &[
+                (Duration::from_millis(5_300), " 5.3s"),
+                (Duration::from_secs(12), "12.0s"),
+                (Duration::from_secs(30), "30.0s"),
+            ],
         );
     }
 
+    /// Happy: minute-range totals use M:SS.t with leading zeros blanked.
+    ///
+    /// Scenario: `sleepx 2m`.
+    /// Purpose: tenths follow the seconds field; prettified zeros stay blank.
+    /// Means: format zero, 65.3s and 120s against a 120s total.
+    /// Checks: `    0.0`, ` 1:05.3`, ` 2:00.0`.
     #[test]
-    fn format_duration_fixed_two_digit_seconds() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(5), Duration::from_secs(30)),
-            " 5s"
+    fn format_duration_fixed_minutes_shows_tenths() {
+        assert_formats(
+            Duration::from_secs(120),
+            &[
+                (Duration::ZERO, "    0.0"),
+                (Duration::from_millis(65_300), " 1:05.3"),
+                (Duration::from_secs(120), " 2:00.0"),
+            ],
         );
     }
 
+    /// Happy: hour-range totals use H:MM:SS.t with leading zeros blanked.
+    ///
+    /// Scenario: `sleepx 2h`.
+    /// Purpose: the longest format also carries tenths.
+    /// Means: format zero and 3661.3s against a 7200s total.
+    /// Checks: `       0.0`, ` 1:01:01.3`.
     #[test]
-    fn format_duration_fixed_two_digit_full() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(12), Duration::from_secs(30)),
-            "12s"
+    fn format_duration_fixed_hours_shows_tenths() {
+        assert_formats(
+            Duration::from_secs(7200),
+            &[
+                (Duration::ZERO, "       0.0"),
+                (Duration::from_millis(3_661_300), " 1:01:01.3"),
+            ],
         );
     }
 
-    #[test]
-    fn format_duration_fixed_minutes_range() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(65), Duration::from_secs(120)),
-            " 1:05"
-        );
-    }
-
-    #[test]
-    fn format_duration_fixed_minutes_zero() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(0), Duration::from_secs(120)),
-            "    0"
-        );
-    }
-
-    #[test]
-    fn format_duration_fixed_minutes_exact() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(120), Duration::from_secs(120)),
-            " 2:00"
-        );
-    }
-
-    #[test]
-    fn format_duration_fixed_hours_range() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(3661), Duration::from_secs(7200)),
-            " 1:01:01"
-        );
-    }
-
-    #[test]
-    fn format_duration_fixed_hours_zero() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(0), Duration::from_secs(7200)),
-            "       0"
-        );
-    }
-
+    /// Boundary: three-digit hours widen the hour field.
+    ///
+    /// Scenario: a 100-hour sleep.
+    /// Purpose: the hour field grows with the total instead of overflowing.
+    /// Means: format 100h against a 100h total.
+    /// Checks: `100:00:00.0`.
     #[test]
     fn format_duration_fixed_hundred_hours() {
-        assert_eq!(
-            format_duration_fixed(Duration::from_secs(360000), Duration::from_secs(360000)),
-            "100:00:00"
+        assert_formats(
+            Duration::from_secs(360_000),
+            &[(Duration::from_secs(360_000), "100:00:00.0")],
+        );
+    }
+
+    /// Boundary: tenths are truncated, never rounded up.
+    ///
+    /// Scenario: 12.39s have passed.
+    /// Purpose: the display must not run ahead of real time.
+    /// Means: format values just below, at and above a tenth boundary.
+    /// Checks: 12.299999999s -> `12.2s`, 12.3s -> `12.3s`, 12.399s -> `12.3s`.
+    #[test]
+    fn format_duration_fixed_truncates_tenths() {
+        assert_formats(
+            Duration::from_secs(30),
+            &[
+                (Duration::new(12, 299_999_999), "12.2s"),
+                (Duration::from_millis(12_300), "12.3s"),
+                (Duration::from_millis(12_399), "12.3s"),
+            ],
         );
     }
 
@@ -803,39 +1348,84 @@ mod tests {
 
     // === duration_display_width ===
 
+    /// Boundary: display width steps up at 10s, 60s, 3600s and 100h totals.
+    ///
+    /// Scenario: the bar width is computed from how wide the times print.
+    /// Purpose: width must match `format_duration_fixed`, including ".t".
+    /// Means: check totals on both sides of each format boundary.
+    /// Checks: 9s->4, 10s->5, 59s->5, 60s->7, 3599s->7, 3600s->10, 100h->11.
     #[test]
-    fn duration_display_width_single_digit_seconds() {
-        assert_eq!(duration_display_width(Duration::from_secs(5)), 2);
+    fn duration_display_width_matches_formatted_width() {
+        let cases = [
+            (9, 4),
+            (10, 5),
+            (59, 5),
+            (60, 7),
+            (3_599, 7),
+            (3_600, 10),
+            (360_000, 11),
+        ];
+        for (secs, expected) in cases {
+            let total = Duration::from_secs(secs);
+            assert_eq!(duration_display_width(total), expected, "total: {secs}s");
+            assert_eq!(
+                format_duration_fixed(total, total).len(),
+                expected,
+                "formatted width for total: {secs}s"
+            );
+        }
     }
 
+    // === render_progress ===
+
+    /// Happy: total minus remaining equals elapsed, to the tenth.
+    ///
+    /// Scenario: 12.34s into `sleepx 30` with the bar off.
+    /// Purpose: the equation layout must stay arithmetically true with tenths.
+    /// Means: render without bar or color at 12.34s of 30s.
+    /// Checks: `30.0s - 17.7s = 12.3s  41.1%`.
     #[test]
-    fn duration_display_width_two_digit_seconds() {
-        assert_eq!(duration_display_width(Duration::from_secs(10)), 3);
+    fn render_progress_equation_holds_in_tenths() {
+        let chars = BarChars {
+            fill: "#".to_string(),
+            empty: "-".to_string(),
+            tip: None,
+            bar_left: "[".to_string(),
+            bar_right: "]".to_string(),
+        };
+        let line = render_progress(
+            Duration::from_millis(12_340),
+            Duration::from_secs(30),
+            &chars,
+            true,
+            &NO_COLOR,
+        );
+        assert_eq!(line, "30.0s - 17.7s = 12.3s  41.1%");
     }
 
+    /// Boundary: a total that is not a whole number of tenths still balances.
+    ///
+    /// Scenario: `sleepx 0.35`, 0.34s in.
+    /// Purpose: total is truncated like elapsed, so remaining never goes negative.
+    /// Means: render without bar or color at 0.34s of 0.35s.
+    /// Checks: `0.3s - 0.0s = 0.3s`.
     #[test]
-    fn duration_display_width_thirty_seconds() {
-        assert_eq!(duration_display_width(Duration::from_secs(30)), 3);
-    }
-
-    #[test]
-    fn duration_display_width_one_minute() {
-        assert_eq!(duration_display_width(Duration::from_secs(60)), 5);
-    }
-
-    #[test]
-    fn duration_display_width_under_one_hour() {
-        assert_eq!(duration_display_width(Duration::from_secs(3599)), 5);
-    }
-
-    #[test]
-    fn duration_display_width_one_hour() {
-        assert_eq!(duration_display_width(Duration::from_secs(3600)), 8);
-    }
-
-    #[test]
-    fn duration_display_width_hundred_hours() {
-        assert_eq!(duration_display_width(Duration::from_secs(360000)), 9);
+    fn render_progress_truncates_total_like_elapsed() {
+        let chars = BarChars {
+            fill: "#".to_string(),
+            empty: "-".to_string(),
+            tip: None,
+            bar_left: "[".to_string(),
+            bar_right: "]".to_string(),
+        };
+        let line = render_progress(
+            Duration::from_millis(340),
+            Duration::from_millis(350),
+            &chars,
+            true,
+            &NO_COLOR,
+        );
+        assert!(line.starts_with("0.3s - 0.0s = 0.3s"), "line: {line}");
     }
 
     // === non_tty_interval ===

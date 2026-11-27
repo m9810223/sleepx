@@ -66,22 +66,22 @@ demo-all:
 test *ARGS:
     cargo test {{ ARGS }}
 
-[doc("Test TTY mode (interactive, with progress bar and milliseconds)")]
+[doc("Test TTY mode (one line redrawn in place, with progress bar)")]
 [group("test")]
 test-tty *ARGS:
     cargo run -- {{ ARGS }}
 
-[doc("Test non-TTY mode (piped, no bar, no milliseconds)")]
+[doc("Test non-TTY mode (stderr piped: one line per update, no bar)")]
 [group("test")]
 test-no-tty *ARGS:
-    cargo run -- {{ ARGS }} | cat
+    cargo run -- {{ ARGS }} 2>&1 | cat
 
 [doc("Test both TTY and non-TTY modes")]
 [group("test")]
 test-modes:
     @echo "=== TTY mode (interactive) ===" && cargo run -- 3
     @echo ""
-    @echo "=== non-TTY mode (piped) ===" && cargo run -- 3 | cat
+    @echo "=== non-TTY mode (piped) ===" && cargo run -- 3 2>&1 | cat
 
 [doc("Remove build artifacts")]
 [group("dev")]
