@@ -1,5 +1,6 @@
 //! End-to-end tests that run the compiled `sleepx` binary.
 
+use std::io::{BufRead, BufReader};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -198,4 +199,45 @@ fn rejects_bar_characters_that_are_not_single_characters() {
         assert_usage_error(&["0.1", flag, "ab"], "single character");
     }
     assert_usage_error(&["0.1", "--bar-left", ""], "single character");
+}
+
+// ---- output streams ----
+
+/// Happy: progress goes to stderr and stdout stays empty.
+///
+/// Scenario: `x=$(sleepx 30)` in a script, or `sleepx 5 && next` in a pipeline.
+/// Purpose: progress is diagnostic output; capturing stdout must not pick it up.
+/// Means: run a 0.2s sleep with both streams captured.
+/// Checks: exit 0; stdout is empty; stderr contains the "Done!" line.
+#[test]
+fn writes_progress_to_stderr_and_nothing_to_stdout() {
+    let out = run(&["0.2"]);
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(stderr.contains("Done!"), "stderr: {stderr}");
+}
+
+/// Sad: a closed progress pipe ends the run quietly with status 141.
+///
+/// Scenario: `sleepx 5 2>&1 | head -1`.
+/// Purpose: writing to a closed pipe used to panic; exit like a SIGPIPE death.
+/// Means: read the first stderr line, close the reader, wait for the process.
+/// Checks: exit status 141.
+#[test]
+fn exits_quietly_with_141_when_progress_reader_goes_away() {
+    let mut child = sleepx()
+        .arg("5")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn sleepx");
+    let mut reader = BufReader::new(child.stderr.take().expect("stderr is piped"));
+    let mut first_line = String::new();
+    reader
+        .read_line(&mut first_line)
+        .expect("read first progress line");
+    drop(reader);
+
+    let status = child.wait().expect("wait for sleepx");
+    assert_eq!(status.code(), Some(141), "first line: {first_line}");
 }

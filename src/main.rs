@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
-use terminal_size::{Width, terminal_size};
+use terminal_size::{Width, terminal_size_of};
 
 /// A sleep command with an inline progress bar and countdown display.
 ///
@@ -288,24 +288,50 @@ fn non_tty_interval(remaining: Duration, min: Duration, max: Duration) -> Durati
     base.clamp(min, max)
 }
 
+/// Usable width of the terminal behind stderr, where progress is drawn.
 fn get_terminal_width() -> usize {
-    terminal_size()
+    terminal_size_of(io::stderr())
         .map(|(Width(w), _)| (w as usize).saturating_sub(1))
         .unwrap_or(79)
 }
 
-/// Clear previously rendered output that may have wrapped across multiple lines.
-fn clear_wrapped_lines(prev_output_len: usize) {
-    let term_width = get_terminal_width();
+/// Escape sequence that returns to the start of the previous output, which
+/// may have wrapped across several rows, and clears from there to the end.
+fn clear_previous_output(prev_output_len: usize, term_width: usize) -> String {
+    let mut seq = String::new();
     if prev_output_len > 0 && term_width > 0 {
-        let lines = (prev_output_len + term_width - 1) / term_width;
+        let lines = prev_output_len.div_ceil(term_width);
         if lines > 1 {
             // Move cursor up to the first wrapped line
-            print!("\x1b[{}A", lines - 1);
+            seq.push_str(&format!("\x1b[{}A", lines - 1));
         }
     }
     // Return to column 1 and clear from cursor to end of display
-    print!("\r\x1b[J");
+    seq.push_str("\r\x1b[J");
+    seq
+}
+
+/// Exit status when the progress reader has gone away; this is what a shell
+/// reports for a process killed by SIGPIPE (128 + 13).
+const EXIT_BROKEN_PIPE: i32 = 141;
+
+/// Exit status for any other failure to write progress.
+const EXIT_WRITE_FAILED: i32 = 1;
+
+fn write_error_exit_code(err: &io::Error) -> i32 {
+    if err.kind() == io::ErrorKind::BrokenPipe {
+        EXIT_BROKEN_PIPE
+    } else {
+        EXIT_WRITE_FAILED
+    }
+}
+
+/// Writes progress text, exiting without a message if the stream is unusable:
+/// progress is the only output, so there is nowhere left to report the error.
+fn write_progress(out: &mut impl Write, text: &str) {
+    if let Err(err) = out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        std::process::exit(write_error_exit_code(&err));
+    }
 }
 
 fn render_progress(
@@ -512,7 +538,9 @@ fn main() {
     .expect("Failed to set Ctrl+C handler");
 
     let start = Instant::now();
-    let is_tty = io::stdout().is_terminal();
+    // Progress goes to stderr so stdout stays empty for callers that capture it.
+    let mut out = io::stderr();
+    let is_tty = out.is_terminal();
     let orig_termios = if is_tty { disable_echoctl() } else { None };
     let no_bar = match cli.bar {
         BarVisibility::On => false,
@@ -537,13 +565,13 @@ fn main() {
         if interrupted.load(Ordering::SeqCst) {
             let elapsed = start.elapsed().min(total);
             let output = render_progress(elapsed, total, &chars, no_bar, theme);
-            if is_tty {
-                clear_wrapped_lines(prev_display_width);
-                print!("{}\x1b[K\n", output);
+            let line = if is_tty {
+                let clear = clear_previous_output(prev_display_width, get_terminal_width());
+                format!("{clear}{output}\x1b[K\n")
             } else {
-                println!("{}", output);
-            }
-            io::stdout().flush().ok();
+                format!("{output}\n")
+            };
+            write_progress(&mut out, &line);
             if let Some(ref orig) = orig_termios {
                 restore_termios(orig);
             }
@@ -563,9 +591,8 @@ fn main() {
 
         if is_tty {
             let output = render_progress(elapsed, total, &chars, no_bar, theme);
-            clear_wrapped_lines(prev_display_width);
-            print!("{}\x1b[K", output);
-            io::stdout().flush().ok();
+            let clear = clear_previous_output(prev_display_width, get_terminal_width());
+            write_progress(&mut out, &format!("{clear}{output}\x1b[K"));
             prev_display_width = if no_bar {
                 output.len()
             } else {
@@ -578,7 +605,7 @@ fn main() {
 
             if last_print.elapsed() >= interval {
                 let output = render_progress(elapsed, total, &chars, no_bar, theme);
-                println!("{}", output);
+                write_progress(&mut out, &format!("{output}\n"));
                 last_print = Instant::now();
             }
             thread::sleep(Duration::from_millis(100));
@@ -593,12 +620,11 @@ fn main() {
     let done_msg = render_done(total, &chars, no_bar, theme);
 
     if is_tty {
-        clear_wrapped_lines(prev_display_width);
-        print!("{}\x1b[K\n", done_msg);
+        let clear = clear_previous_output(prev_display_width, get_terminal_width());
+        write_progress(&mut out, &format!("{clear}{done_msg}\x1b[K\n"));
     } else {
-        println!("{}", done_msg);
+        write_progress(&mut out, &format!("{done_msg}\n"));
     }
-    io::stdout().flush().ok();
 
     // macOS say
     if cli.say
@@ -612,6 +638,48 @@ fn main() {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // === output helpers ===
+
+    /// Boundary: output that fits one row needs no cursor-up.
+    ///
+    /// Scenario: redrawing a progress line in an 80-column terminal.
+    /// Purpose: moving up when nothing wrapped would erase the line above.
+    /// Means: previous lengths of 0 and exactly the terminal width.
+    /// Checks: both give only "return and clear".
+    #[test]
+    fn clear_previous_output_without_wrapping() {
+        assert_eq!(clear_previous_output(0, 80), "\r\x1b[J");
+        assert_eq!(clear_previous_output(80, 80), "\r\x1b[J");
+    }
+
+    /// Boundary: one column past the width means one wrapped row.
+    ///
+    /// Scenario: the window was narrowed below the previous line's length.
+    /// Purpose: the cursor must climb to the first row of the old output.
+    /// Means: previous lengths of 81 and 160 at width 80, and 161.
+    /// Checks: 81 and 160 move up 1 row; 161 moves up 2.
+    #[test]
+    fn clear_previous_output_climbs_wrapped_rows() {
+        assert_eq!(clear_previous_output(81, 80), "\x1b[1A\r\x1b[J");
+        assert_eq!(clear_previous_output(160, 80), "\x1b[1A\r\x1b[J");
+        assert_eq!(clear_previous_output(161, 80), "\x1b[2A\r\x1b[J");
+    }
+
+    /// Sad: a write error maps to an exit status by its kind.
+    ///
+    /// Scenario: the progress reader closed the pipe, or the log disk is full.
+    /// Purpose: a closed pipe should look like a SIGPIPE death (141); other
+    /// failures exit 1.
+    /// Means: classify a BrokenPipe and a PermissionDenied error.
+    /// Checks: 141 and 1.
+    #[test]
+    fn write_error_exit_code_distinguishes_broken_pipe() {
+        let broken = io::Error::from(io::ErrorKind::BrokenPipe);
+        let other = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(write_error_exit_code(&broken), 141);
+        assert_eq!(write_error_exit_code(&other), 1);
+    }
 
     // === parse_duration ===
 
