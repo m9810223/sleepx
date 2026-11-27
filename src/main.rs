@@ -18,9 +18,14 @@ use terminal_size::{Width, terminal_size_of};
 #[derive(Parser)]
 #[command(name = "sleepx", version, about)]
 struct Cli {
-    /// Duration to sleep. Examples: 30, 1m30s, 2h5m
-    #[arg(value_parser = parse_duration)]
-    duration: Duration,
+    /// Duration to sleep; several are added together. Examples: 30, 1m30s, 2h5m
+    #[arg(
+        value_parser = parse_duration,
+        required = true,
+        num_args = 1..,
+        allow_negative_numbers = true
+    )]
+    duration: Vec<Duration>,
 
     /// Progress bar style: arrow, dot, block, hash
     #[arg(short = 'S', long, default_value = "arrow", env = "SLEEPX_STYLE")]
@@ -174,10 +179,25 @@ fn parse_duration(input: &str) -> Result<Duration, String> {
         return secs_to_duration(secs);
     }
 
+    // humantime reads `M` as months; `5M` is almost always a typo for minutes.
+    if input.contains('M') {
+        return Err(
+            "ambiguous unit 'M' (months): use 'm' for minutes or 'months' for months".to_string(),
+        );
+    }
+
     // Try parsing as humantime format (e.g. 1m30s, 2h5m)
     humantime::parse_duration(input).map_err(|_| {
         "invalid duration (expected seconds like 30 or 1.5, or units like 1m30s, 2h)".to_string()
     })
+}
+
+/// Adds the durations together, as coreutils `sleep` does with several arguments.
+fn sum_durations(parts: &[Duration]) -> Result<Duration, String> {
+    parts
+        .iter()
+        .try_fold(Duration::ZERO, |acc, &d| acc.checked_add(d))
+        .ok_or_else(|| "total duration is too large".to_string())
 }
 
 fn parse_interval(input: &str) -> Result<Duration, String> {
@@ -539,7 +559,8 @@ fn restore_termios(original: &libc::termios) {
 fn main() {
     let cli = Cli::parse();
 
-    let total = cli.duration;
+    let total = sum_durations(&cli.duration)
+        .unwrap_or_else(|msg| Cli::command().error(ErrorKind::ValueValidation, msg).exit());
     let min_interval = cli.min_interval;
     let max_interval = cli.max_interval;
     if min_interval > max_interval {
@@ -778,6 +799,50 @@ mod tests {
                 "input: {input}"
             );
         }
+    }
+
+    /// Sad: uppercase `M` is rejected; minutes and spelled-out months still parse.
+    ///
+    /// Scenario: `sleepx 5M` meant as five minutes.
+    /// Purpose: humantime reads `M` as months; only the ambiguous form is refused.
+    /// Means: parse `5M`, `5m` and `1months`.
+    /// Checks: `5M` errors with a hint; `5m` is 300s; `1months` parses.
+    #[test]
+    fn parse_duration_rejects_uppercase_m_only() {
+        assert!(parse_duration("5M").unwrap_err().contains("'m' for minutes"));
+        assert_eq!(parse_duration("5m"), Ok(Duration::from_secs(300)));
+        assert!(parse_duration("1months").is_ok());
+    }
+
+    /// Happy: durations are summed, one or many.
+    ///
+    /// Scenario: `sleepx 0.5` versus `sleepx 0.5 0.5 0.5`.
+    /// Purpose: summing must also work for a single argument.
+    /// Means: sum one and three half-second values.
+    /// Checks: 0.5s and 1.5s.
+    #[test]
+    fn sum_durations_adds_one_or_many() {
+        let half = Duration::from_millis(500);
+        assert_eq!(sum_durations(&[half]), Ok(half));
+        assert_eq!(
+            sum_durations(&[half, half, half]),
+            Ok(Duration::from_millis(1500))
+        );
+    }
+
+    /// Boundary: the sum may reach `Duration::MAX` but not exceed it.
+    ///
+    /// Scenario: very large arguments that only overflow together.
+    /// Purpose: overflow must be reported, not wrap or panic.
+    /// Means: sum `MAX` alone, and `MAX` plus one nanosecond.
+    /// Checks: `MAX` is accepted; `MAX + 1ns` is "total duration is too large".
+    #[test]
+    fn sum_durations_reports_overflow() {
+        assert_eq!(sum_durations(&[Duration::MAX]), Ok(Duration::MAX));
+        assert_eq!(
+            sum_durations(&[Duration::MAX, Duration::from_nanos(1)]),
+            Err("total duration is too large".to_string())
+        );
     }
 
     /// Boundary: values beyond `Duration::MAX` are "too large".

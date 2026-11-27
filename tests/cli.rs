@@ -368,3 +368,65 @@ fn say_env_rejects_unrecognized_value() {
     assert_eq!(code, Some(2), "stderr: {stderr}");
     assert!(stderr.starts_with("error:"), "stderr: {stderr}");
 }
+
+// ---- duration arguments ----
+
+/// Happy: several durations are added together.
+///
+/// Scenario: `sleepx 1m 30s`, as coreutils `sleep` allows.
+/// Purpose: a second argument used to be rejected as unexpected.
+/// Means: run with `0.1 0.2`.
+/// Checks: exit 0; the final line shows a 0.3s total.
+#[test]
+fn sums_multiple_durations_like_coreutils_sleep() {
+    let out = run(&["0.1", "0.2"]);
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stderr.contains("0.3s - 0.0s = Done!"), "stderr: {stderr}");
+}
+
+/// Sad: at least one duration is required.
+///
+/// Scenario: a bare `sleepx`.
+/// Purpose: clap should name the missing argument.
+/// Means: run with no arguments.
+/// Checks: usage error mentioning `<DURATION>`.
+#[test]
+fn requires_at_least_one_duration() {
+    assert_usage_error(&[], "<DURATION>");
+}
+
+/// Boundary: a sum beyond what `Duration` can hold is a usage error.
+///
+/// Scenario: `sleepx 1.8e19 1.8e19`; each fits, the total does not.
+/// Purpose: adding must not overflow or panic.
+/// Means: run with two values just under `Duration::MAX`.
+/// Checks: usage error mentioning "too large".
+#[test]
+fn rejects_sum_too_large_to_represent() {
+    assert_usage_error(&["1.8e19", "1.8e19"], "too large");
+}
+
+/// Sad: negative numbers get a duration error, not "unexpected argument".
+///
+/// Scenario: `sleepx -1`.
+/// Purpose: clap used to treat `-1` as an unknown flag.
+/// Means: run with `-1` and `-0.5`.
+/// Checks: usage error mentioning "must not be negative".
+#[test]
+fn rejects_negative_numbers_with_a_clear_message() {
+    for input in ["-1", "-0.5"] {
+        assert_usage_error(&[input], "must not be negative");
+    }
+}
+
+/// Sad: an uppercase `M` is rejected instead of meaning months.
+///
+/// Scenario: `sleepx 5M`, almost always meant as five minutes.
+/// Purpose: humantime reads `M` as months, so this silently slept ~5 months.
+/// Means: run with `5M` (the run timeout guards against a real sleep).
+/// Checks: usage error suggesting `m` for minutes.
+#[test]
+fn rejects_uppercase_m_instead_of_reading_it_as_months() {
+    assert_usage_error(&["5M"], "'m' for minutes");
+}
