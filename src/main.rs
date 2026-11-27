@@ -303,6 +303,32 @@ fn duration_display_width(total: Duration) -> usize {
     whole + TENTHS_WIDTH
 }
 
+const NANOS_PER_SEC: u128 = 1_000_000_000;
+
+/// How often the loop wakes to check for signals and redraw.
+const TICK: Duration = Duration::from_millis(100);
+
+fn duration_from_nanos(nanos: u128) -> Duration {
+    let secs = u64::try_from(nanos / NANOS_PER_SEC).unwrap_or(u64::MAX);
+    let subsec = u32::try_from(nanos % NANOS_PER_SEC).expect("remainder is below 1e9");
+    Duration::new(secs, subsec)
+}
+
+/// Time until the next tick boundary (counted from the start), capped at the
+/// time left, so ticks do not drift and the sleep never overshoots the end.
+fn time_to_next_tick(elapsed: Duration, total: Duration) -> Duration {
+    let into_tick = duration_from_nanos(elapsed.as_nanos() % TICK.as_nanos());
+    (TICK - into_tick).min(total.saturating_sub(elapsed))
+}
+
+/// The first multiple of `interval` (counted from the start) after `elapsed`,
+/// so non-TTY lines land on round timestamps such as 5.0s, 10.0s, 15.0s.
+fn next_print_at(elapsed: Duration, interval: Duration) -> Duration {
+    let interval_nanos = interval.as_nanos();
+    let multiples = elapsed.as_nanos() / interval_nanos + 1;
+    duration_from_nanos(multiples.saturating_mul(interval_nanos))
+}
+
 fn non_tty_interval(remaining: Duration, min: Duration, max: Duration) -> Duration {
     let base = if remaining > Duration::from_secs(3600) {
         Duration::from_secs(60)
@@ -613,7 +639,7 @@ fn main() {
             }
         }
     };
-    let mut last_print = Instant::now() - Duration::from_secs(9999); // force first print
+    let mut next_print = Duration::ZERO;
     let mut prev_display_width: usize = 0;
 
     loop {
@@ -649,18 +675,14 @@ fn main() {
             } else {
                 get_terminal_width()
             };
-            thread::sleep(Duration::from_millis(100));
-        } else {
+        } else if elapsed >= next_print {
+            let output = render_progress(elapsed, total, &chars, no_bar, theme);
+            write_progress(&mut out, &format!("{output}\n"));
             let remaining = total.saturating_sub(elapsed);
             let interval = non_tty_interval(remaining, min_interval, max_interval);
-
-            if last_print.elapsed() >= interval {
-                let output = render_progress(elapsed, total, &chars, no_bar, theme);
-                write_progress(&mut out, &format!("{output}\n"));
-                last_print = Instant::now();
-            }
-            thread::sleep(Duration::from_millis(100));
+            next_print = next_print_at(elapsed, interval);
         }
+        thread::sleep(time_to_next_tick(elapsed, total));
     }
 
     if let Some(ref orig) = orig_termios {
@@ -689,6 +711,84 @@ fn main() {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // === scheduling ===
+
+    /// Boundary: sleeps end on 100ms boundaries counted from the start.
+    ///
+    /// Scenario: the loop wakes a little late after each check.
+    /// Purpose: a fixed 100ms sleep let lateness pile up (0.25s took ~0.32s).
+    /// Means: elapsed at 0, just before, at and just after the 200ms boundary.
+    /// Checks: 100ms, 1ns, 100ms, 99.999999ms.
+    #[test]
+    fn time_to_next_tick_aligns_to_tick_boundaries() {
+        let total = Duration::from_secs(10);
+        let cases = [
+            (Duration::ZERO, Duration::from_millis(100)),
+            (Duration::new(0, 199_999_999), Duration::from_nanos(1)),
+            (Duration::from_millis(200), Duration::from_millis(100)),
+            (Duration::new(0, 200_000_001), Duration::new(0, 99_999_999)),
+        ];
+        for (elapsed, expected) in cases {
+            assert_eq!(
+                time_to_next_tick(elapsed, total),
+                expected,
+                "elapsed: {elapsed:?}"
+            );
+        }
+    }
+
+    /// Boundary: the last sleep stops at the end, not at the next tick.
+    ///
+    /// Scenario: `sleepx 0.25`, 200ms in.
+    /// Purpose: never sleep past the requested duration.
+    /// Means: 200ms elapsed of 250ms.
+    /// Checks: 50ms.
+    #[test]
+    fn time_to_next_tick_never_sleeps_past_the_end() {
+        assert_eq!(
+            time_to_next_tick(Duration::from_millis(200), Duration::from_millis(250)),
+            Duration::from_millis(50)
+        );
+    }
+
+    /// Boundary: the next non-TTY line lands on the next multiple of the interval.
+    ///
+    /// Scenario: logging every second; a check runs slightly late.
+    /// Purpose: timestamps stay on round values (1.0s, 2.0s) instead of drifting.
+    /// Means: elapsed at 0, just before, at and just after 1s, interval 1s.
+    /// Checks: 1s, 1s, 2s, 2s.
+    #[test]
+    fn next_print_at_is_the_following_multiple_of_the_interval() {
+        let interval = Duration::from_secs(1);
+        let cases = [
+            (Duration::ZERO, Duration::from_secs(1)),
+            (Duration::new(0, 999_999_999), Duration::from_secs(1)),
+            (Duration::from_secs(1), Duration::from_secs(2)),
+            (Duration::new(1, 1), Duration::from_secs(2)),
+        ];
+        for (elapsed, expected) in cases {
+            assert_eq!(
+                next_print_at(elapsed, interval),
+                expected,
+                "elapsed: {elapsed:?}"
+            );
+        }
+    }
+
+    /// Happy: a late check skips the multiples it already missed.
+    ///
+    /// Scenario: the interval just grew from 1s to 5s at 10.05s.
+    /// Purpose: the next line is scheduled ahead, not in the past.
+    /// Means: elapsed 10.05s, interval 5s.
+    /// Checks: 15s.
+    #[test]
+    fn next_print_at_skips_missed_multiples() {
+        assert_eq!(
+            next_print_at(Duration::from_millis(10_050), Duration::from_secs(5)),
+            Duration::from_secs(15)
+        );
+    }
 
     // === output helpers ===
 
