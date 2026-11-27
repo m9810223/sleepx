@@ -1,4 +1,8 @@
+use std::env;
+use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,15 +14,22 @@ use clap::{CommandFactory, Parser};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use terminal_size::{Width, terminal_size_of};
 
-/// A sleep command with an inline progress bar and countdown display.
+const EXAMPLES: &str = "\
+Examples:
+  sleepx 30                 Sleep 30 seconds
+  sleepx 1m 30s             Several durations are added together
+  sleepx 5m --say           Announce when done (macOS)
+  sleepx 1h 2>> build.log   Log one progress line per update";
+
+/// Sleep with an inline progress bar, shown as total - remaining = elapsed.
 ///
-/// In TTY mode, the progress bar overwrites the same line.
-/// In non-TTY mode (piped/redirected), outputs one line per update
-/// with no progress bar by default.
+/// Progress goes to stderr; stdout stays empty. When stderr is a terminal,
+/// one line is redrawn in place. Otherwise one line is printed per update,
+/// without a bar unless --bar on is given.
 #[derive(Parser)]
-#[command(name = "sleepx", version, about)]
+#[command(name = "sleepx", version, after_help = EXAMPLES)]
 struct Cli {
-    /// Duration to sleep; several are added together. Examples: 30, 1m30s, 2h5m
+    /// Duration to sleep; several are added together (30, 1.5, 1m30s, 2h)
     #[arg(
         value_parser = parse_duration,
         required = true,
@@ -27,48 +38,123 @@ struct Cli {
     )]
     duration: Vec<Duration>,
 
-    /// Progress bar style: arrow, dot, block, hash
-    #[arg(short = 'S', long, default_value = "arrow", env = "SLEEPX_STYLE")]
+    /// Progress bar style
+    #[arg(
+        short = 'S',
+        long,
+        default_value = "arrow",
+        env = "SLEEPX_STYLE",
+        hide_env_values = true
+    )]
     style: BarStyle,
 
-    /// Custom left bracket character (default: [)
-    #[arg(long, default_value = "[", env = "SLEEPX_BAR_LEFT", value_parser = parse_single_char)]
+    /// Left bracket character
+    #[arg(
+        long,
+        value_name = "CHAR",
+        default_value = "[",
+        env = "SLEEPX_BAR_LEFT",
+        hide_env_values = true,
+        value_parser = parse_single_char
+    )]
     bar_left: String,
 
-    /// Custom fill character (overrides --style)
-    #[arg(long, env = "SLEEPX_BAR_FILL", value_parser = parse_single_char)]
+    /// Fill character (overrides --style)
+    #[arg(
+        long,
+        value_name = "CHAR",
+        env = "SLEEPX_BAR_FILL",
+        hide_env_values = true,
+        value_parser = parse_single_char
+    )]
     bar_fill: Option<String>,
 
-    /// Custom tip character for progress indicator (e.g., >)
-    #[arg(long, env = "SLEEPX_BAR_TIP", value_parser = parse_single_char)]
+    /// Tip character at the head of the fill, e.g. >
+    #[arg(
+        long,
+        value_name = "CHAR",
+        env = "SLEEPX_BAR_TIP",
+        hide_env_values = true,
+        value_parser = parse_single_char
+    )]
     bar_tip: Option<String>,
 
-    /// Custom empty character (overrides --style)
-    #[arg(long, env = "SLEEPX_BAR_EMPTY", value_parser = parse_single_char)]
+    /// Empty character (overrides --style)
+    #[arg(
+        long,
+        value_name = "CHAR",
+        env = "SLEEPX_BAR_EMPTY",
+        hide_env_values = true,
+        value_parser = parse_single_char
+    )]
     bar_empty: Option<String>,
 
-    /// Custom right bracket character (default: ])
-    #[arg(long, default_value = "]", env = "SLEEPX_BAR_RIGHT", value_parser = parse_single_char)]
+    /// Right bracket character
+    #[arg(
+        long,
+        value_name = "CHAR",
+        default_value = "]",
+        env = "SLEEPX_BAR_RIGHT",
+        hide_env_values = true,
+        value_parser = parse_single_char
+    )]
     bar_right: String,
 
-    /// Progress bar visibility: auto (default), on, off
-    #[arg(short = 'b', long, default_value = "auto", env = "SLEEPX_BAR")]
+    /// Show the progress bar; auto shows it only when stderr is a terminal
+    #[arg(
+        short = 'b',
+        long,
+        default_value = "auto",
+        env = "SLEEPX_BAR",
+        hide_env_values = true
+    )]
     bar: BarVisibility,
 
-    /// Color output: auto (default, TTY only), on, off
-    #[arg(short = 'c', long, default_value = "auto", env = "SLEEPX_COLOR")]
+    /// Color output; auto colors only when stderr is a terminal
+    #[arg(
+        short = 'c',
+        long,
+        default_value = "auto",
+        env = "SLEEPX_COLOR",
+        hide_env_values = true
+    )]
     color: ColorMode,
 
-    /// Use macOS `say` to announce when done
-    #[arg(short = 's', long, env = "SLEEPX_SAY", value_parser = parse_bool_env)]
+    /// Announce "Timer complete" with macOS `say` when done
+    #[arg(
+        short = 's',
+        long,
+        env = "SLEEPX_SAY",
+        hide_env_values = true,
+        value_parser = parse_bool_env
+    )]
     say: bool,
 
-    /// Min output interval in seconds for non-TTY mode
-    #[arg(short = 'n', long, default_value = "1", env = "SLEEPX_MIN_INTERVAL", value_parser = parse_interval)]
+    /// Shortest gap between lines when stderr is not a terminal
+    ///
+    /// The gap steps from 1s to 60s as more time remains, then is clamped
+    /// to --min-interval and --max-interval.
+    #[arg(
+        short = 'n',
+        long,
+        value_name = "SECONDS",
+        default_value = "1",
+        env = "SLEEPX_MIN_INTERVAL",
+        hide_env_values = true,
+        value_parser = parse_interval
+    )]
     min_interval: Duration,
 
-    /// Max output interval in seconds for non-TTY mode
-    #[arg(short = 'x', long, default_value = "60", env = "SLEEPX_MAX_INTERVAL", value_parser = parse_interval)]
+    /// Longest gap between lines when stderr is not a terminal
+    #[arg(
+        short = 'x',
+        long,
+        value_name = "SECONDS",
+        default_value = "60",
+        env = "SLEEPX_MAX_INTERVAL",
+        hide_env_values = true,
+        value_parser = parse_interval
+    )]
     max_interval: Duration,
 }
 
@@ -530,6 +616,21 @@ fn render_done(total: Duration, chars: &BarChars, no_bar: bool, theme: &Theme) -
     )
 }
 
+const SAY_COMMAND: &str = "say";
+
+/// Whether an executable file named `name` exists in one of the `path` dirs.
+fn find_in_path(name: &str, path: Option<&OsStr>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    env::split_paths(path).any(|dir| is_executable(&dir.join(name)))
+}
+
+fn is_executable(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
 /// Signals that end the sleep early.
 const STOP_SIGNALS: [i32; 3] = [SIGINT, SIGTERM, SIGHUP];
 
@@ -618,6 +719,13 @@ fn main() {
 
     let stop_signal = install_stop_handlers();
 
+    // Check up front, so a missing `say` is reported now rather than after
+    // the whole sleep. It stays a warning: the sleep itself still works.
+    let say = cli.say && find_in_path(SAY_COMMAND, env::var_os("PATH").as_deref());
+    if cli.say && !say {
+        eprintln!("warning: `{SAY_COMMAND}` not found in PATH; --say is ignored");
+    }
+
     let start = Instant::now();
     // Progress goes to stderr so stdout stays empty for callers that capture it.
     let mut out = io::stderr();
@@ -699,11 +807,10 @@ fn main() {
         write_progress(&mut out, &format!("{done_msg}\n"));
     }
 
-    // macOS say
-    if cli.say
-        && let Err(e) = Command::new("say").arg("Timer complete").spawn()
+    if say
+        && let Err(e) = Command::new(SAY_COMMAND).arg("Timer complete").spawn()
     {
-        eprintln!("Warning: failed to run `say`: {}", e);
+        eprintln!("warning: failed to run `{SAY_COMMAND}`: {e}");
     }
 }
 
@@ -788,6 +895,31 @@ mod tests {
             next_print_at(Duration::from_millis(10_050), Duration::from_secs(5)),
             Duration::from_secs(15)
         );
+    }
+
+    // === say lookup ===
+
+    /// Happy: an executable is found in a later PATH entry.
+    ///
+    /// Scenario: PATH lists a missing directory before the one with the tool.
+    /// Purpose: lookup must walk every entry, not stop at the first.
+    /// Means: look for `sh` in "/nonexistent:/bin".
+    /// Checks: found.
+    #[test]
+    fn find_in_path_finds_an_executable_in_a_later_entry() {
+        assert!(find_in_path("sh", Some(OsStr::new("/nonexistent:/bin"))));
+    }
+
+    /// Sad: unknown names and an unset PATH find nothing.
+    ///
+    /// Scenario: `--say` on a system without `say`, or with PATH unset.
+    /// Purpose: either case must report "not found" rather than error out.
+    /// Means: look for a made-up name in /bin, and for `sh` with no PATH.
+    /// Checks: both are not found.
+    #[test]
+    fn find_in_path_misses_unknown_names_and_unset_path() {
+        assert!(!find_in_path("sleepx-no-such-tool", Some(OsStr::new("/bin"))));
+        assert!(!find_in_path("sh", None));
     }
 
     // === output helpers ===

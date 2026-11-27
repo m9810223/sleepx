@@ -430,3 +430,82 @@ fn rejects_negative_numbers_with_a_clear_message() {
 fn rejects_uppercase_m_instead_of_reading_it_as_months() {
     assert_usage_error(&["5M"], "'m' for minutes");
 }
+
+// ---- say and help ----
+
+/// Sad: a missing `say` is reported at startup, and the sleep still runs.
+///
+/// Scenario: `SLEEPX_SAY=1` in a profile shared with a Linux machine.
+/// Purpose: the warning used to appear only after the whole sleep.
+/// Means: run `--say` with PATH pointing nowhere.
+/// Checks: exit 0; stderr starts with the missing-`say` warning.
+#[test]
+fn warns_at_startup_when_say_is_missing() {
+    let mut cmd = sleepx();
+    cmd.args(["0.1", "--say"]).env("PATH", "/nonexistent");
+    let out = output_with_timeout(cmd);
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.starts_with("warning: `say` not found"),
+        "stderr: {stderr}"
+    );
+}
+
+fn help_text(flag: &str) -> String {
+    let out = run(&[flag]);
+    assert_eq!(out.status.code(), Some(0), "{flag} failed");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Happy: short help shows the tool's own description and examples.
+///
+/// Scenario: a first-time user runs `sleepx -h`.
+/// Purpose: `-h` showed only Cargo's one-line description and no examples.
+/// Means: run `-h`.
+/// Checks: it mentions the equation layout and has an "Examples:" section.
+#[test]
+fn short_help_uses_the_tool_description_and_examples() {
+    let help = help_text("-h");
+    assert!(help.contains("total - remaining = elapsed"), "help: {help}");
+    assert!(help.contains("Examples:"), "help: {help}");
+}
+
+/// Happy: help names values by meaning.
+///
+/// Scenario: reading `--help` to learn what each option takes.
+/// Purpose: names like `<BAR_FILL>` or `<MIN_INTERVAL>` repeat the flag.
+/// Means: run `--help`.
+/// Checks: it shows `<DURATION>...`, `<CHAR>` and `<SECONDS>`.
+#[test]
+fn help_names_values_by_meaning() {
+    let help = help_text("--help");
+    for name in ["<DURATION>...", "<CHAR>", "<SECONDS>"] {
+        assert!(help.contains(name), "missing {name} in help: {help}");
+    }
+}
+
+/// Happy: help lists env vars without their current values.
+///
+/// Scenario: `--help` with no `SLEEPX_*` set.
+/// Purpose: `[env: SLEEPX_STYLE=]` looks like a broken empty assignment.
+/// Means: run `--help`.
+/// Checks: `[env: SLEEPX_STYLE]` appears; `SLEEPX_STYLE=` does not.
+#[test]
+fn help_lists_env_vars_without_values() {
+    let help = help_text("--help");
+    assert!(help.contains("[env: SLEEPX_STYLE]"), "help: {help}");
+    assert!(!help.contains("SLEEPX_STYLE="), "help: {help}");
+}
+
+/// Happy: long help explains how output intervals are chosen.
+///
+/// Scenario: `-n 0.5` seems to have no effect.
+/// Purpose: the base gap steps from 1s to 60s; the flags only clamp it.
+/// Means: run `--help`.
+/// Checks: it mentions "1s to 60s".
+#[test]
+fn help_explains_interval_range() {
+    let help = help_text("--help");
+    assert!(help.contains("1s to 60s"), "help: {help}");
+}
