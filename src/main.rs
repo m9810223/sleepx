@@ -668,8 +668,12 @@ fn die_by_signal(signal: usize) -> ! {
 }
 
 /// Disable `ECHOCTL` so the terminal does not echo `^C` on Ctrl+C.
-/// Returns the original termios settings for later restoration.
+/// Returns the original termios settings for later restoration, or `None`
+/// when running in the background or when the settings cannot be changed.
 fn disable_echoctl() -> Option<libc::termios> {
+    if !in_foreground() {
+        return None;
+    }
     unsafe {
         let mut orig: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(libc::STDIN_FILENO, &mut orig) != 0 {
@@ -684,10 +688,27 @@ fn disable_echoctl() -> Option<libc::termios> {
     }
 }
 
+/// Restore the settings saved by `disable_echoctl`. SIGTTOU is blocked
+/// around the call, so this still works (instead of stopping the process)
+/// if the job was moved to the background after it started, e.g. Ctrl+Z
+/// then `bg`.
 fn restore_termios(original: &libc::termios) {
     unsafe {
+        let mut ttou: libc::sigset_t = std::mem::zeroed();
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut ttou);
+        libc::sigaddset(&mut ttou, libc::SIGTTOU);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &ttou, &mut previous);
         libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, original);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
     }
+}
+
+/// Whether this process is in the terminal's foreground process group.
+/// A background job (`sleepx 30 &`) that changes terminal settings is
+/// stopped by SIGTTOU, so only the foreground job may touch them.
+fn in_foreground() -> bool {
+    unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) == libc::getpgrp() }
 }
 
 fn main() {
