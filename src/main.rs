@@ -438,6 +438,27 @@ fn get_terminal_width() -> usize {
         .unwrap_or(79)
 }
 
+/// Columns `text` occupies on screen: characters, not bytes, and not the
+/// ANSI control sequences (`ESC [ ... final`) used for color.
+fn visible_width(text: &str) -> usize {
+    let mut width = 0;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.clone().next() == Some('[') {
+            chars.next();
+            // Skip parameters up to and including the final byte (0x40..=0x7E).
+            for c in chars.by_ref() {
+                if ('\x40'..='\x7e').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
 /// Escape sequence that returns to the start of the previous output, which
 /// may have wrapped across several rows, and clears from there to the end.
 fn clear_previous_output(prev_output_len: usize, term_width: usize) -> String {
@@ -807,7 +828,7 @@ fn main() {
             let clear = clear_previous_output(prev_display_width, get_terminal_width());
             write_progress(&mut out, &format!("{clear}{output}\x1b[K"));
             prev_display_width = if no_bar {
-                output.len()
+                visible_width(&output)
             } else {
                 get_terminal_width()
             };
@@ -952,6 +973,44 @@ mod tests {
     }
 
     // === output helpers ===
+
+    /// Happy: visible width ignores color codes and counts characters.
+    ///
+    /// Scenario: measuring a progress line to decide how many rows it took.
+    /// Purpose: color escapes take bytes but no columns; multi-byte
+    /// characters take one column each.
+    /// Means: measure plain text, colored text, and two stars.
+    /// Checks: 3, 5 and 2.
+    #[test]
+    fn visible_width_skips_color_codes() {
+        assert_eq!(visible_width("abc"), 3);
+        assert_eq!(visible_width("\x1b[33m12.3s\x1b[0m"), 5);
+        assert_eq!(visible_width("★☆"), 2);
+    }
+
+    /// Sad: a colored progress line is as wide as the uncolored one.
+    ///
+    /// Scenario: `--bar off` in a 40-column terminal with color on.
+    /// Purpose: measuring bytes counted ~26 extra columns of color codes, so
+    /// each redraw moved the cursor up and erased a line above.
+    /// Means: render the same moment with the color theme and without.
+    /// Checks: both have the same visible width.
+    #[test]
+    fn colored_line_has_the_same_visible_width_as_plain() {
+        let chars = BarChars {
+            fill: "#".to_string(),
+            empty: "-".to_string(),
+            tip: None,
+            bar_left: "[".to_string(),
+            bar_right: "]".to_string(),
+        };
+        let at = Duration::from_millis(5_300);
+        let total = Duration::from_secs(30);
+        let colored = render_progress(at, total, &chars, true, &COLOR_THEME);
+        let plain = render_progress(at, total, &chars, true, &NO_COLOR);
+        assert_ne!(colored.len(), plain.len(), "theme must add escapes");
+        assert_eq!(visible_width(&colored), plain.chars().count());
+    }
 
     /// Boundary: output that fits one row needs no cursor-up.
     ///
